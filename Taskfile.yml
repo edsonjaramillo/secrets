@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev
+version: "3"
+vars:
+  BIN_DIR: ~/.local/bin
+  EXECUTABLE: secrets
+  VERSION: dev
+
+tasks:
+  build:
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build -ldflags="-s -w -X secrets/internal/commands.Version={{.VERSION}}" -o {{.BIN_DIR}}/{{.EXECUTABLE}} {{.MAIN}}
+    silent: true
+  test:
+    cmd: go test ./...
+    silent: true
+  lint:
+    cmd: golangci-lint run ./...
+    silent: true
+  format:
+    cmd: gofumpt -w .
+    silent: true
