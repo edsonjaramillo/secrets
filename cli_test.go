@@ -358,21 +358,213 @@ func TestGetCache(t *testing.T) {
 		}
 	})
 
-	t.Run("a miss validates existing state before contacting op", func(t *testing.T) {
+	t.Run("concurrent misses retain both Cache Entries", func(t *testing.T) {
 		environment := isolatedEnvironment(t)
-		root := cacheRoot(environment)
-		if err := os.MkdirAll(filepath.Join(root, "values"), 0o700); err != nil {
-			t.Fatalf("create malformed cache: %v", err)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact-slow")
+		references := []string{"op://vault/first/field", "op://vault/second/field"}
+		start := make(chan struct{})
+		results := make(chan result, len(references))
+		for _, reference := range references {
+			go func() {
+				<-start
+				results <- runCommand(exec.Command(binary, "get", reference), environment)
+			}()
 		}
-		if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte("not json"), 0o600); err != nil {
-			t.Fatalf("write malformed metadata: %v", err)
+		close(start)
+		for range references {
+			assertSecretResult(t, <-results, []byte("opaque value\nwith trailing newline\n"))
 		}
+
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		if len(metadata.Entries) != len(references) {
+			t.Fatalf("concurrent misses retained %d entries, want %d", len(metadata.Entries), len(references))
+		}
+		for _, reference := range references {
+			if _, err := os.Stat(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(reference))); err != nil {
+				t.Errorf("missing concurrent value: %v", err)
+			}
+		}
+	})
+
+	t.Run("a targeted hit rejects unsafe state without exposing cache data", func(t *testing.T) {
+		tests := map[string]func(*testing.T, string, string){
+			"unsafe root permissions": func(t *testing.T, root, _ string) {
+				if err := os.Chmod(root, 0o755); err != nil {
+					t.Fatalf("make cache root unsafe: %v", err)
+				}
+			},
+			"unsafe values directory permissions": func(t *testing.T, root, _ string) {
+				if err := os.Chmod(filepath.Join(root, "values"), 0o755); err != nil {
+					t.Fatalf("make values directory unsafe: %v", err)
+				}
+			},
+			"unsafe metadata permissions": func(t *testing.T, root, _ string) {
+				if err := os.Chmod(filepath.Join(root, "metadata.json"), 0o644); err != nil {
+					t.Fatalf("make metadata unsafe: %v", err)
+				}
+			},
+			"unsafe requested value permissions": func(t *testing.T, root, identifier string) {
+				if err := os.Chmod(filepath.Join(root, "values", identifier), 0o644); err != nil {
+					t.Fatalf("make value unsafe: %v", err)
+				}
+			},
+			"lock has wrong type": func(t *testing.T, root, _ string) {
+				lockPath := filepath.Join(root, "cache.lock")
+				if err := os.Remove(lockPath); err != nil {
+					t.Fatalf("remove lock: %v", err)
+				}
+				if err := os.Mkdir(lockPath, 0o700); err != nil {
+					t.Fatalf("replace lock with directory: %v", err)
+				}
+			},
+			"foreign requested value ownership": func(t *testing.T, root, identifier string) {
+				if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+					t.Skip("ownership guarantees are supported on macOS and Linux")
+				}
+				if os.Geteuid() != 0 {
+					t.Skip("changing file ownership requires root")
+				}
+				if err := os.Chown(filepath.Join(root, "values", identifier), 1, -1); err != nil {
+					t.Fatalf("change value owner: %v", err)
+				}
+			},
+			"symlinked values directory": func(t *testing.T, root, _ string) {
+				valuesPath := filepath.Join(root, "values")
+				outside := filepath.Join(t.TempDir(), "values")
+				if err := os.Rename(valuesPath, outside); err != nil {
+					t.Fatalf("move values directory: %v", err)
+				}
+				if err := os.Symlink(outside, valuesPath); err != nil {
+					t.Fatalf("symlink values directory: %v", err)
+				}
+			},
+			"symlinked requested value": func(t *testing.T, root, identifier string) {
+				valuePath := filepath.Join(root, "values", identifier)
+				content, err := os.ReadFile(valuePath)
+				if err != nil {
+					t.Fatalf("read value before replacing it: %v", err)
+				}
+				outside := filepath.Join(t.TempDir(), "value")
+				if err := os.WriteFile(outside, content, 0o600); err != nil {
+					t.Fatalf("write symlink target: %v", err)
+				}
+				if err := os.Remove(valuePath); err != nil {
+					t.Fatalf("remove value: %v", err)
+				}
+				if err := os.Symlink(outside, valuePath); err != nil {
+					t.Fatalf("symlink value: %v", err)
+				}
+			},
+			"unknown metadata schema": func(t *testing.T, root, _ string) {
+				metadata := readCacheMetadata(t, root)
+				metadata.Version = 2
+				writeCacheMetadata(t, root, metadata)
+			},
+			"hash mismatch": func(t *testing.T, root, _ string) {
+				metadata := readCacheMetadata(t, root)
+				metadata.Entries[0].Identifier = strings.Repeat("0", 64)
+				writeCacheMetadata(t, root, metadata)
+			},
+		}
+		for name, corrupt := range tests {
+			t.Run(name, func(t *testing.T) {
+				environment := isolatedEnvironment(t)
+				environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+				reference := "op://vault/private-item/field"
+				assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+				resetInvocation(t, environment)
+				corrupt(t, cacheRoot(environment), referenceIdentifier(reference))
+
+				got := runCLI(t, binary, environment, "get", reference)
+
+				assertControlledGetFailure(t, got, "Error: cache state is invalid; inspect and remove the cache directory manually\n")
+				if strings.Contains(got.stdout, "opaque value") || strings.Contains(got.stderr, reference) {
+					t.Error("cache corruption failure exposed cache data")
+				}
+				assertNotInvoked(t, environment)
+			})
+		}
+	})
+
+	t.Run("an oversized targeted value fails with remediation guidance", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
 		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/private-item/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		valuePath := filepath.Join(cacheRoot(environment), "values", referenceIdentifier(reference))
+		if err := os.Truncate(valuePath, 16*1024*1024+1); err != nil {
+			t.Fatalf("make cached value oversized: %v", err)
+		}
+		resetInvocation(t, environment)
 
-		got := runCLI(t, binary, environment, "get", "op://vault/new/field")
+		got := runCLI(t, binary, environment, "get", reference)
 
-		assertControlledGetFailure(t, got, "Error: cache state is invalid\n")
+		assertControlledGetFailure(t, got, "Error: cache state is invalid; inspect and remove the cache directory manually\n")
 		assertNotInvoked(t, environment)
+	})
+
+	t.Run("a targeted hit ignores an unrelated missing value", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		target := "op://vault/item/field"
+		unrelated := "op://vault/other/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", target), []byte("opaque value\nwith trailing newline\n"))
+		assertSecretResult(t, runCLI(t, binary, environment, "get", unrelated), []byte("opaque value\nwith trailing newline\n"))
+		if err := os.Remove(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(unrelated))); err != nil {
+			t.Fatalf("remove unrelated value: %v", err)
+		}
+		resetInvocation(t, environment)
+
+		got := runCLI(t, binary, environment, "get", target)
+
+		assertSecretResult(t, got, []byte("opaque value\nwith trailing newline\n"))
+		assertNotInvoked(t, environment)
+	})
+
+	t.Run("a miss validates complete state before contacting op", func(t *testing.T) {
+		tests := map[string]func(*testing.T, string, string){
+			"malformed metadata": func(t *testing.T, root, _ string) {
+				if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte("not json"), 0o600); err != nil {
+					t.Fatalf("write malformed metadata: %v", err)
+				}
+			},
+			"duplicate metadata key": func(t *testing.T, root, _ string) {
+				content := []byte(`{"version":2,"version":1,"entries":[]}`)
+				if err := os.WriteFile(filepath.Join(root, "metadata.json"), content, 0o600); err != nil {
+					t.Fatalf("write duplicate metadata key: %v", err)
+				}
+			},
+			"missing indexed value": func(t *testing.T, root, identifier string) {
+				if err := os.Remove(filepath.Join(root, "values", identifier)); err != nil {
+					t.Fatalf("remove indexed value: %v", err)
+				}
+			},
+			"orphan value": func(t *testing.T, root, _ string) {
+				if err := os.WriteFile(filepath.Join(root, "values", strings.Repeat("f", 64)), []byte("orphan"), 0o600); err != nil {
+					t.Fatalf("write orphan value: %v", err)
+				}
+			},
+			"unexpected root file": func(t *testing.T, root, _ string) {
+				if err := os.WriteFile(filepath.Join(root, "unexpected"), []byte("unexpected"), 0o600); err != nil {
+					t.Fatalf("write unexpected file: %v", err)
+				}
+			},
+		}
+		for name, corrupt := range tests {
+			t.Run(name, func(t *testing.T) {
+				environment := isolatedEnvironment(t)
+				environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+				reference := "op://vault/item/field"
+				assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+				resetInvocation(t, environment)
+				corrupt(t, cacheRoot(environment), referenceIdentifier(reference))
+
+				got := runCLI(t, binary, environment, "get", "op://vault/new/field")
+
+				assertControlledGetFailure(t, got, "Error: cache state is invalid; inspect and remove the cache directory manually\n")
+				assertNotInvoked(t, environment)
+			})
+		}
 	})
 }
 
@@ -396,6 +588,24 @@ func readCacheMetadata(t *testing.T, root string) cacheMetadata {
 		t.Fatalf("parse cache metadata: %v", err)
 	}
 	return metadata
+}
+
+func writeCacheMetadata(t *testing.T, root string, metadata cacheMetadata) {
+	t.Helper()
+	content, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("marshal cache metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "metadata.json"), append(content, '\n'), 0o600); err != nil {
+		t.Fatalf("write cache metadata: %v", err)
+	}
+}
+
+func resetInvocation(t *testing.T, environment testEnvironment) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(environment.fakeBin, "op-invoked")); err != nil {
+		t.Fatalf("remove invocation marker: %v", err)
+	}
 }
 
 func cacheRoot(environment testEnvironment) string {
@@ -580,6 +790,11 @@ case "$1:$FAKE_OP_MODE" in
     exit 0
     ;;
   read:get-exact)
+    printf 'opaque value\nwith trailing newline\n'
+    exit 0
+    ;;
+  read:get-exact-slow)
+    sleep 0.1
     printf 'opaque value\nwith trailing newline\n'
     exit 0
     ;;

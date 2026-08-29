@@ -35,7 +35,7 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 
 	store, err := cache.NewStore()
 	if err != nil {
-		return errors.New("cache operation failed")
+		return cacheFailure(err)
 	}
 	cachedValue, found, err := store.Lookup(reference)
 	if err != nil {
@@ -43,7 +43,7 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 	}
 	if found {
 		if len(cachedValue) > maximumSecretValueSize {
-			return errors.New("cache state is invalid")
+			return cacheFailure(cache.ErrInvalidState)
 		}
 		_, err = stdout.Write(cachedValue)
 		return err
@@ -97,7 +97,10 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 
 func cacheFailure(err error) error {
 	if errors.Is(err, cache.ErrInvalidState) {
-		return errors.New("cache state is invalid")
+		return errors.New("cache state is invalid; inspect and remove the cache directory manually")
+	}
+	if errors.Is(err, cache.ErrUnsupportedPlatform) {
+		return errors.New("cache security checks are unsupported on this platform")
 	}
 	return errors.New("cache operation failed")
 }
