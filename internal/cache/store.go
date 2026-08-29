@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,9 @@ const (
 	schemaVersion   = 1
 	directoryMode   = 0o700
 	regularFileMode = 0o600
+
+	// MaximumSecretValueSize bounds values accepted from or retained in the cache.
+	MaximumSecretValueSize = 16 * 1024 * 1024
 )
 
 var (
@@ -29,6 +33,12 @@ var (
 // Store persists Cache Entries below the operating system user cache directory.
 type Store struct {
 	root string
+}
+
+// ListingEntry contains the non-secret fields shown by cache administration commands.
+type ListingEntry struct {
+	Reference string
+	CachedAt  string
 }
 
 type metadata struct {
@@ -83,7 +93,7 @@ func (store Store) Lookup(reference string) ([]byte, bool, error) {
 	}
 
 	valuePath := filepath.Join(store.root, "values", matched.Identifier)
-	if err := validateNode(valuePath, false); err != nil {
+	if err := validateValueNode(valuePath); err != nil {
 		return nil, false, ErrInvalidState
 	}
 	value, err := os.ReadFile(valuePath)
@@ -91,6 +101,29 @@ func (store Store) Lookup(reference string) ([]byte, bool, error) {
 		return nil, false, ErrInvalidState
 	}
 	return value, true, nil
+}
+
+// List returns every Cache Entry after validating complete cache state.
+func (store Store) List() ([]ListingEntry, error) {
+	lock, exists, err := store.acquireLock(false)
+	if err != nil || !exists {
+		return nil, err
+	}
+	defer releaseLock(lock)
+
+	state, err := store.readValidatedMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]ListingEntry, len(state.Entries))
+	for index, item := range state.Entries {
+		entries[index] = ListingEntry{Reference: item.Reference, CachedAt: item.CachedAt}
+	}
+	sort.Slice(entries, func(left, right int) bool {
+		return entries[left].Reference < entries[right].Reference
+	})
+	return entries, nil
 }
 
 // Validate verifies complete existing state before cache state is mutated.
@@ -104,19 +137,26 @@ func (store Store) Validate() error {
 }
 
 func (store Store) validateUnlocked() error {
+	_, err := store.readValidatedMetadata()
+	return err
+}
+
+func (store Store) readValidatedMetadata() (metadata, error) {
 	state, exists, err := store.readMetadata()
 	if err != nil || !exists {
-		return err
+		return state, err
 	}
-
-	return store.validateValues(state)
+	if err := store.validateValues(state); err != nil {
+		return metadata{}, err
+	}
+	return state, nil
 }
 
 func (store Store) validateValues(state metadata) error {
 	expected := make(map[string]struct{}, len(state.Entries))
 	for _, item := range state.Entries {
 		expected[item.Identifier] = struct{}{}
-		if err := validateNode(filepath.Join(store.root, "values", item.Identifier), false); err != nil {
+		if err := validateValueNode(filepath.Join(store.root, "values", item.Identifier)); err != nil {
 			return ErrInvalidState
 		}
 	}
@@ -129,7 +169,7 @@ func (store Store) validateValues(state metadata) error {
 		if _, ok := expected[file.Name()]; !ok {
 			return ErrInvalidState
 		}
-		if err := validateNode(filepath.Join(store.root, "values", file.Name()), false); err != nil {
+		if err := validateValueNode(filepath.Join(store.root, "values", file.Name())); err != nil {
 			return ErrInvalidState
 		}
 	}
@@ -363,7 +403,7 @@ func validIndex(state metadata) bool {
 	identifiers := make(map[string]struct{}, len(state.Entries))
 	references := make(map[string]struct{}, len(state.Entries))
 	for _, item := range state.Entries {
-		if item.Reference == "" || item.Identifier != Identifier(item.Reference) || !validTimestamp(item.CachedAt) {
+		if !validSecretReference(item.Reference) || item.Identifier != Identifier(item.Reference) || !validTimestamp(item.CachedAt) {
 			return false
 		}
 		if _, duplicate := identifiers[item.Identifier]; duplicate {
@@ -376,6 +416,26 @@ func validIndex(state metadata) bool {
 		references[item.Reference] = struct{}{}
 	}
 	return true
+}
+
+func validSecretReference(reference string) bool {
+	if !strings.HasPrefix(reference, "op://") {
+		return false
+	}
+	for _, character := range []byte(reference) {
+		if character <= 0x1f || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validateValueNode(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || validateInfo(info, false) != nil || info.Size() > MaximumSecretValueSize {
+		return ErrInvalidState
+	}
+	return nil
 }
 
 func validateNode(path string, directory bool) error {

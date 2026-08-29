@@ -15,8 +15,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const maximumSecretValueSize = 16 * 1024 * 1024
-
 func newGetCommand(dependencies Dependencies) *cobra.Command {
 	return &cobra.Command{
 		Use:   "get <reference>",
@@ -42,9 +40,6 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 		return cacheFailure(err)
 	}
 	if found {
-		if len(cachedValue) > maximumSecretValueSize {
-			return cacheFailure(cache.ErrInvalidState)
-		}
 		_, err = stdout.Write(cachedValue)
 		return err
 	}
@@ -160,7 +155,7 @@ type boundedSecretBuffer struct {
 
 func (buffer *boundedSecretBuffer) Write(content []byte) (int, error) {
 	originalLength := len(content)
-	remaining := maximumSecretValueSize - buffer.content.Len()
+	remaining := cache.MaximumSecretValueSize - buffer.content.Len()
 	if len(content) > remaining {
 		buffer.oversized = true
 		content = content[:remaining]

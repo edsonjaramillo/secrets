@@ -24,6 +24,7 @@ Usage:
   secrets [command]
 
 Available Commands:
+  cache       Manage Cache Entries
   completion  Generate the autocompletion script for the specified shell
   get         Retrieve a Secret Value
   help        Help about any command
@@ -641,6 +642,122 @@ func assertNoTemporaryFiles(t *testing.T, path string) {
 		if strings.HasPrefix(entry.Name(), ".temporary-") {
 			t.Errorf("atomic write left temporary file %s", entry.Name())
 		}
+	}
+}
+
+func TestCacheList(t *testing.T) {
+	binary := buildCLI(t, "")
+
+	t.Run("accepts no positional arguments and documents human-readable output", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+
+		got := runCLI(t, binary, environment, "cache", "list", "unexpected")
+		if got.err == nil || got.stdout != "" || !strings.HasPrefix(got.stderr, "Error: ") {
+			t.Error("positional argument was not a concise usage failure")
+		}
+		assertDirectoryEmpty(t, environment.cache)
+
+		help := runCLI(t, binary, environment, "cache", "list", "--help")
+		if help.err != nil || help.stderr != "" || !strings.Contains(help.stdout, "human-readable") {
+			t.Errorf("list help does not document human-readable output: %+v", help)
+		}
+	})
+
+	t.Run("absent and empty caches produce no output without creating state", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+
+		assertResult(t, runCLI(t, binary, environment, "cache", "list"), "", "", false)
+		assertDirectoryEmpty(t, environment.cache)
+
+		createEmptyCache(t, environment)
+		assertResult(t, runCLI(t, binary, environment, "cache", "list"), "", "", false)
+	})
+
+	t.Run("sorts complete state and re-reads it on each invocation", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		laterReference := "op://vault/zeta/field"
+		earlierReference := "op://vault/alpha/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", laterReference), []byte("opaque value\nwith trailing newline\n"))
+
+		first := runCLI(t, binary, environment, "cache", "list")
+		if first.err != nil || first.stderr != "" || !strings.HasSuffix(first.stdout, "\t"+laterReference+"\n") {
+			t.Errorf("unexpected initial listing: %+v", first)
+		}
+
+		assertSecretResult(t, runCLI(t, binary, environment, "get", earlierReference), []byte("opaque value\nwith trailing newline\n"))
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		metadata.Entries[0].CachedAt = "2024-01-02T03:04:05Z"
+		metadata.Entries[1].CachedAt = "2025-06-07T08:09:10Z"
+		metadata.Entries[0], metadata.Entries[1] = metadata.Entries[1], metadata.Entries[0]
+		writeCacheMetadata(t, cacheRoot(environment), metadata)
+
+		got := runCLI(t, binary, environment, "cache", "list")
+		want := "2024-01-02T03:04:05Z\t" + earlierReference + "\n" +
+			"2025-06-07T08:09:10Z\t" + laterReference + "\n"
+		assertResult(t, got, want, "", false)
+		if strings.Contains(got.stdout+got.stderr, "opaque value") {
+			t.Error("listing exposed a Secret Value")
+		}
+	})
+
+	for name, corrupt := range map[string]func(*testing.T, testEnvironment, string){
+		"missing value": func(t *testing.T, environment testEnvironment, reference string) {
+			if err := os.Remove(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(reference))); err != nil {
+				t.Fatalf("remove value: %v", err)
+			}
+		},
+		"oversized value": func(t *testing.T, environment testEnvironment, reference string) {
+			if err := os.Truncate(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(reference)), 16*1024*1024+1); err != nil {
+				t.Fatalf("enlarge value: %v", err)
+			}
+		},
+		"invalid reference": func(t *testing.T, environment testEnvironment, reference string) {
+			root := cacheRoot(environment)
+			metadata := readCacheMetadata(t, root)
+			invalidReference := "not-a-reference"
+			for index := range metadata.Entries {
+				if metadata.Entries[index].Reference == reference {
+					oldIdentifier := metadata.Entries[index].Identifier
+					metadata.Entries[index].Reference = invalidReference
+					metadata.Entries[index].Identifier = referenceIdentifier(invalidReference)
+					if err := os.Rename(filepath.Join(root, "values", oldIdentifier), filepath.Join(root, "values", metadata.Entries[index].Identifier)); err != nil {
+						t.Fatalf("rename value for invalid reference: %v", err)
+					}
+				}
+			}
+			writeCacheMetadata(t, root, metadata)
+		},
+	} {
+		t.Run("validates all state before emitting for "+name, func(t *testing.T) {
+			environment := isolatedEnvironment(t)
+			environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+			privateReference := "op://vault/private/field"
+			for _, reference := range []string{"op://vault/first/field", privateReference} {
+				assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+			}
+			corrupt(t, environment, privateReference)
+
+			got := runCLI(t, binary, environment, "cache", "list")
+			assertResult(t, got, "", "Error: cache state is invalid; inspect and remove the cache directory manually\n", true)
+			if strings.Contains(got.stdout+got.stderr, "opaque value") {
+				t.Error("corruption diagnostic exposed a Secret Value")
+			}
+		})
+	}
+}
+
+func createEmptyCache(t *testing.T, environment testEnvironment) {
+	t.Helper()
+	root := cacheRoot(environment)
+	if err := os.MkdirAll(filepath.Join(root, "values"), 0o700); err != nil {
+		t.Fatalf("create empty cache directories: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cache.lock"), nil, 0o600); err != nil {
+		t.Fatalf("create cache lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte("{\"version\":1,\"entries\":[]}\n"), 0o600); err != nil {
+		t.Fatalf("create empty cache metadata: %v", err)
 	}
 }
 
