@@ -1,10 +1,12 @@
 package cache
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestClearAllReconcilesMetadataAfterPartialRemoval(t *testing.T) {
@@ -70,5 +72,82 @@ func TestClearAllReconcilesMetadataAfterPartialRemoval(t *testing.T) {
 	}
 	if _, err := os.Stat(failedPath); err != nil {
 		t.Errorf("failed removal value is missing: %v", err)
+	}
+}
+
+func TestRevalidateRestoresPreviousEntryWhenMetadataCommitFails(t *testing.T) {
+	if !ownershipChecksSupported() {
+		t.Skip("ownership checks are unsupported on this platform")
+	}
+
+	root := t.TempDir()
+	if err := os.Chmod(root, directoryMode); err != nil {
+		t.Fatalf("protect test root: %v", err)
+	}
+	valuesPath := filepath.Join(root, "values")
+	if err := os.Mkdir(valuesPath, directoryMode); err != nil {
+		t.Fatalf("create values directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cache.lock"), nil, regularFileMode); err != nil {
+		t.Fatalf("create cache lock: %v", err)
+	}
+
+	store := Store{root: root}
+	reference := "op://vault/item/field"
+	identifier := Identifier(reference)
+	previousValue := []byte("previous value\n")
+	state := metadata{
+		Version: schemaVersion,
+		Entries: []entry{{
+			Reference:  reference,
+			Identifier: identifier,
+			CachedAt:   "2020-01-02T03:04:05Z",
+		}},
+	}
+	if err := os.WriteFile(filepath.Join(valuesPath, identifier), previousValue, regularFileMode); err != nil {
+		t.Fatalf("write previous value: %v", err)
+	}
+	if err := store.writeMetadata(state); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	injected := errors.New("injected metadata replacement failure")
+	err := store.revalidate(reference, []byte("replacement value\n"), time.Now(), func(oldPath, newPath string) error {
+		if filepath.Base(newPath) == "metadata.json" {
+			return injected
+		}
+		return os.Rename(oldPath, newPath)
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("revalidate error = %v, want injected failure", err)
+	}
+
+	remaining, err := store.readValidatedMetadata()
+	if err != nil {
+		t.Fatalf("read restored metadata: %v", err)
+	}
+	if len(remaining.Entries) != 1 || remaining.Entries[0].CachedAt != state.Entries[0].CachedAt {
+		t.Fatalf("restored metadata = %+v, want %+v", remaining.Entries, state.Entries)
+	}
+	value, err := os.ReadFile(filepath.Join(valuesPath, identifier))
+	if err != nil {
+		t.Fatalf("read restored value: %v", err)
+	}
+	if !bytes.Equal(value, previousValue) {
+		t.Fatalf("restored value = %q, want %q", value, previousValue)
+	}
+	rootEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read restored cache root: %v", err)
+	}
+	if len(rootEntries) != 3 {
+		t.Errorf("restored cache root has %d entries, want 3", len(rootEntries))
+	}
+	valueEntries, err := os.ReadDir(valuesPath)
+	if err != nil {
+		t.Fatalf("read restored values directory: %v", err)
+	}
+	if len(valueEntries) != 1 || valueEntries[0].Name() != identifier {
+		t.Errorf("restored values directory = %v, want only %s", valueEntries, identifier)
 	}
 }

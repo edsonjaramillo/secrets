@@ -918,6 +918,237 @@ func TestCacheClear(t *testing.T) {
 	})
 }
 
+func TestCacheRevalidate(t *testing.T) {
+	binary := buildCLI(t, "")
+	reference := "op://vault/item/field"
+
+	t.Run("requires exactly one valid Secret Reference before touching state", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"cache", "revalidate"},
+			{"cache", "revalidate", "op://vault/one/field", "op://vault/two/field"},
+			{"cache", "revalidate", "not-a-reference"},
+			{"cache", "revalidate", "--all"},
+		} {
+			environment := isolatedEnvironment(t)
+			got := runCLI(t, binary, environment, args...)
+			if got.err == nil || got.stdout != "" || !strings.HasPrefix(got.stderr, "Error: ") {
+				t.Errorf("arguments %v were not a concise failure: %+v", args, got)
+			}
+			assertDirectoryEmpty(t, environment.cache)
+			assertNotInvoked(t, environment)
+		}
+	})
+
+	t.Run("missing Cache Entry fails without contacting op or creating state", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "revalidate-exact")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", reference)
+
+		assertResult(t, got, "", "Error: cache entry not found\n", true)
+		assertDirectoryEmpty(t, environment.cache)
+		assertNotInvoked(t, environment)
+	})
+
+	t.Run("unknown Cache Entry fails without mutation or contacting op", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before unknown Revalidation: %v", err)
+		}
+		resetInvocation(t, environment)
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", "op://vault/missing/field")
+
+		assertResult(t, got, "", "Error: cache entry not found\n", true)
+		assertNotInvoked(t, environment)
+		afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after unknown Revalidation: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, afterMetadata) {
+			t.Error("unknown Revalidation changed metadata")
+		}
+	})
+
+	t.Run("successful Revalidation replaces unchanged and changed Secret Values and timestamp", func(t *testing.T) {
+		for _, test := range []struct {
+			name  string
+			mode  string
+			value []byte
+		}{
+			{name: "changed value", mode: "revalidate-exact", value: []byte("revalidated value\nwith trailing newline\n")},
+			{name: "unchanged value", mode: "revalidate-same", value: []byte("opaque value\nwith trailing newline\n")},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				environment := isolatedEnvironment(t)
+				setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+				assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+
+				root := cacheRoot(environment)
+				metadata := readCacheMetadata(t, root)
+				metadata.Entries[0].CachedAt = "2020-01-02T03:04:05Z"
+				writeCacheMetadata(t, root, metadata)
+				beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+				if err != nil {
+					t.Fatalf("read metadata before Revalidation: %v", err)
+				}
+
+				setEnvironmentVariable(&environment, "FAKE_OP_MODE", test.mode)
+				got := runCLI(t, binary, environment, "cache", "revalidate", reference)
+
+				assertResult(t, got, "", "", false)
+				afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+				if err != nil {
+					t.Fatalf("read metadata after Revalidation: %v", err)
+				}
+				if bytes.Equal(beforeMetadata, afterMetadata) {
+					t.Error("successful Revalidation did not update the cache timestamp")
+				}
+				updated := readCacheMetadata(t, root)
+				cachedAt, err := time.Parse(time.RFC3339, updated.Entries[0].CachedAt)
+				if err != nil || cachedAt.Equal(time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)) || cachedAt.Location() != time.UTC {
+					t.Errorf("successful Revalidation wrote an invalid replacement timestamp: %q", updated.Entries[0].CachedAt)
+				}
+				value, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+				if err != nil {
+					t.Fatalf("read replaced Secret Value: %v", err)
+				}
+				if !bytes.Equal(value, test.value) {
+					t.Errorf("revalidated Secret Value = %q, want %q", value, test.value)
+				}
+				if got.stdout != "" || got.stderr != "" {
+					t.Error("successful Revalidation was not silent")
+				}
+			})
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		mode string
+		want string
+	}{
+		{name: "authentication failure", mode: "get-auth-required", want: "Error: authentication required; run `op signin` or enable 1Password desktop-app CLI integration\n"},
+		{name: "retrieval failure", mode: "get-unknown", want: "Error: 1Password command failed with exit code 23\n"},
+		{name: "oversized output", mode: "get-oversized", want: "Error: secret value exceeds the 16 MiB limit\n"},
+	} {
+		t.Run(test.name+" preserves the previous Cache Entry", func(t *testing.T) {
+			environment := isolatedEnvironment(t)
+			setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+			root := cacheRoot(environment)
+			beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+			if err != nil {
+				t.Fatalf("read metadata before failed Revalidation: %v", err)
+			}
+			beforeValue, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+			if err != nil {
+				t.Fatalf("read value before failed Revalidation: %v", err)
+			}
+
+			setEnvironmentVariable(&environment, "FAKE_OP_MODE", test.mode)
+			got := runCLI(t, binary, environment, "cache", "revalidate", reference)
+
+			assertResult(t, got, "", test.want, true)
+			afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+			if err != nil {
+				t.Fatalf("read metadata after failed Revalidation: %v", err)
+			}
+			if !bytes.Equal(beforeMetadata, afterMetadata) {
+				t.Error("failed Revalidation changed the cache timestamp")
+			}
+			afterValue, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+			if err != nil {
+				t.Fatalf("read value after failed Revalidation: %v", err)
+			}
+			if !bytes.Equal(beforeValue, afterValue) {
+				t.Error("failed Revalidation changed the previous Secret Value")
+			}
+			if strings.Contains(got.stdout+got.stderr, reference) || strings.Contains(got.stdout+got.stderr, "opaque value") {
+				t.Error("failed Revalidation exposed private cache data")
+			}
+		})
+	}
+
+	t.Run("interruption preserves the previous Cache Entry", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before interrupted Revalidation: %v", err)
+		}
+		beforeValue, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+		if err != nil {
+			t.Fatalf("read value before interrupted Revalidation: %v", err)
+		}
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-hang")
+
+		got := runCLIWithTerminalArgs(t, binary, environment, "", true, "cache", "revalidate", reference)
+
+		assertResult(t, got, "", "Error: 1Password request interrupted\n", true)
+		afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after interrupted Revalidation: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, afterMetadata) {
+			t.Error("interrupted Revalidation changed the cache timestamp")
+		}
+		afterValue, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+		if err != nil {
+			t.Fatalf("read value after interrupted Revalidation: %v", err)
+		}
+		if !bytes.Equal(beforeValue, afterValue) {
+			t.Error("interrupted Revalidation changed the previous Secret Value")
+		}
+	})
+
+	t.Run("validates complete state before contacting op", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before corruption: %v", err)
+		}
+		if err := os.Remove(filepath.Join(root, "values", referenceIdentifier(reference))); err != nil {
+			t.Fatalf("remove indexed value: %v", err)
+		}
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "revalidate-exact")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", reference)
+
+		assertResult(t, got, "", "Error: cache state is invalid; inspect and remove the cache directory manually\n", true)
+		assertNotInvoked(t, environment)
+		afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after rejected Revalidation: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, afterMetadata) {
+			t.Error("validation failure changed metadata")
+		}
+	})
+}
+
+func setEnvironmentVariable(environment *testEnvironment, name, value string) {
+	prefix := name + "="
+	for index, variable := range environment.variables {
+		if strings.HasPrefix(variable, prefix) {
+			environment.variables[index] = prefix + value
+			return
+		}
+	}
+	environment.variables = append(environment.variables, prefix+value)
+}
+
 func createEmptyCache(t *testing.T, environment testEnvironment) {
 	t.Helper()
 	root := cacheRoot(environment)
@@ -1077,7 +1308,18 @@ case "$1:$FAKE_OP_MODE" in
   whoami:get-*)
     exit 0
     ;;
+  whoami:revalidate-*)
+    exit 0
+    ;;
   read:get-exact)
+    printf 'opaque value\nwith trailing newline\n'
+    exit 0
+    ;;
+  read:revalidate-exact)
+    printf 'revalidated value\nwith trailing newline\n'
+    exit 0
+    ;;
+  read:revalidate-same)
     printf 'opaque value\nwith trailing newline\n'
     exit 0
     ;;

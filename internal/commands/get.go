@@ -47,16 +47,34 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 		return cacheFailure(err)
 	}
 
-	ctx := parent
-	cancel := func() {}
-	if !dependencies.StdinInteractive() {
-		ctx, cancel = context.WithTimeout(parent, 5*time.Second)
-	}
+	ctx, cancel := onePasswordContext(parent, dependencies)
 	defer cancel()
 
+	value, err := retrieveSecretValue(ctx, dependencies, reference)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return classifyOnePasswordFailure(ctx, err, "", false)
+	}
+	if err := store.Put(reference, value, time.Now()); err != nil {
+		return cacheFailure(err)
+	}
+	_, err = stdout.Write(value)
+	return err
+}
+
+func onePasswordContext(parent context.Context, dependencies Dependencies) (context.Context, context.CancelFunc) {
+	if dependencies.StdinInteractive() {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, 5*time.Second)
+}
+
+func retrieveSecretValue(ctx context.Context, dependencies Dependencies, reference string) ([]byte, error) {
 	path, err := exec.LookPath("op")
 	if err != nil {
-		return errors.New("1Password CLI is not installed")
+		return nil, errors.New("1Password CLI is not installed")
 	}
 
 	var probeOutput, probeDiagnostic limitedBuffer
@@ -66,7 +84,7 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 	probe.Stdout = &probeOutput
 	probe.Stderr = &probeDiagnostic
 	if err := probe.Run(); err != nil {
-		return classifyOnePasswordFailure(ctx, err, probeOutput.String()+"\n"+probeDiagnostic.String(), true)
+		return nil, classifyOnePasswordFailure(ctx, err, probeOutput.String()+"\n"+probeDiagnostic.String(), true)
 	}
 
 	var value boundedSecretBuffer
@@ -77,17 +95,16 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 	read.Stdout = &value
 	read.Stderr = &diagnostic
 	if err := read.Run(); err != nil {
-		return classifyOnePasswordFailure(ctx, err, value.content.String()+"\n"+diagnostic.String(), false)
+		return nil, classifyOnePasswordFailure(ctx, err, value.content.String()+"\n"+diagnostic.String(), false)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, classifyOnePasswordFailure(ctx, err, "", false)
 	}
 	if value.oversized {
-		return errors.New("secret value exceeds the 16 MiB limit")
+		return nil, errors.New("secret value exceeds the 16 MiB limit")
 	}
 
-	if err := store.Put(reference, value.content.Bytes(), time.Now()); err != nil {
-		return cacheFailure(err)
-	}
-	_, err = stdout.Write(value.content.Bytes())
-	return err
+	return value.content.Bytes(), nil
 }
 
 func cacheFailure(err error) error {

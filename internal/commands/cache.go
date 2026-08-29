@@ -1,15 +1,17 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/edsonjaramillo/secrets/internal/cache"
 	"github.com/spf13/cobra"
 )
 
-func newCacheCommand() *cobra.Command {
+func newCacheCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "cache",
 		Short: "Manage Cache Entries",
@@ -18,7 +20,7 @@ func newCacheCommand() *cobra.Command {
 			return command.Help()
 		},
 	}
-	command.AddCommand(newCacheListCommand(), newCacheClearCommand())
+	command.AddCommand(newCacheListCommand(), newCacheClearCommand(), newCacheRevalidateCommand(dependencies))
 	return command
 }
 
@@ -60,6 +62,57 @@ func newCacheClearCommand() *cobra.Command {
 	}
 	command.Flags().BoolVar(&all, "all", false, "Remove all Cache Entries")
 	return command
+}
+
+func newCacheRevalidateCommand(dependencies Dependencies) *cobra.Command {
+	return &cobra.Command{
+		Use:   "revalidate <reference>",
+		Short: "Replace one existing Cache Entry",
+		Args: func(_ *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return errors.New("requires exactly one Secret Reference")
+			}
+			if !validSecretReference(args[0]) {
+				return errors.New("invalid Secret Reference")
+			}
+			return nil
+		},
+		RunE: func(command *cobra.Command, args []string) error {
+			return runCacheRevalidate(command.Context(), dependencies, args[0])
+		},
+	}
+}
+
+func runCacheRevalidate(parent context.Context, dependencies Dependencies, reference string) error {
+	if !validSecretReference(reference) {
+		return errors.New("invalid Secret Reference")
+	}
+
+	store, err := cache.NewStore()
+	if err != nil {
+		return cacheFailure(err)
+	}
+	found, err := store.ValidateEntry(reference)
+	if err != nil {
+		return cacheFailure(err)
+	}
+	if !found {
+		return cacheFailure(cache.ErrEntryNotFound)
+	}
+
+	ctx, cancel := onePasswordContext(parent, dependencies)
+	defer cancel()
+	value, err := retrieveSecretValue(ctx, dependencies, reference)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return classifyOnePasswordFailure(ctx, err, "", false)
+	}
+	if err := store.Revalidate(reference, value, time.Now()); err != nil {
+		return cacheFailure(err)
+	}
+	return nil
 }
 
 func runCacheClear(args []string, all bool) error {

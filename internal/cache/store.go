@@ -228,6 +228,30 @@ func (store Store) Validate() error {
 	return store.validateUnlocked()
 }
 
+// ValidateEntry verifies complete cache state and reports whether reference is indexed.
+func (store Store) ValidateEntry(reference string) (bool, error) {
+	lock, exists, err := store.acquireLock(false)
+	if err != nil || !exists {
+		return false, err
+	}
+	defer releaseLock(lock)
+
+	state, err := store.readValidatedMetadata()
+	if err != nil {
+		return false, err
+	}
+	return hasEntry(state, reference), nil
+}
+
+func hasEntry(state metadata, reference string) bool {
+	for _, item := range state.Entries {
+		if item.Reference == reference {
+			return true
+		}
+	}
+	return false
+}
+
 func (store Store) validateUnlocked() error {
 	_, err := store.readValidatedMetadata()
 	return err
@@ -336,13 +360,94 @@ func (store Store) Put(reference string, value []byte, cachedAt time.Time) error
 	return store.writeMetadata(state)
 }
 
-func (store Store) writeMetadata(state metadata) error {
-	content, err := json.Marshal(state)
+// Revalidate replaces an existing Cache Entry after the new Secret Value has
+// been retrieved successfully. It never creates a missing Cache Entry.
+func (store Store) Revalidate(reference string, value []byte, cachedAt time.Time) error {
+	return store.revalidate(reference, value, cachedAt, os.Rename)
+}
+
+// revalidate accepts the rename operation separately so commit rollback can be
+// exercised without changing process-wide filesystem behavior.
+func (store Store) revalidate(reference string, value []byte, cachedAt time.Time, rename func(string, string) error) error {
+	if len(value) > MaximumSecretValueSize {
+		return ErrInvalidState
+	}
+
+	lock, exists, err := store.acquireLock(true)
 	if err != nil {
 		return err
 	}
-	content = append(content, '\n')
+	if !exists {
+		return ErrEntryNotFound
+	}
+	defer releaseLock(lock)
+
+	state, err := store.readValidatedMetadata()
+	if err != nil {
+		return err
+	}
+	index := -1
+	for current, item := range state.Entries {
+		if item.Reference == reference {
+			index = current
+			break
+		}
+	}
+	if index < 0 {
+		return ErrEntryNotFound
+	}
+
+	valuePath := filepath.Join(store.root, "values", state.Entries[index].Identifier)
+	previousValue, err := os.ReadFile(valuePath)
+	if err != nil {
+		return ErrInvalidState
+	}
+
+	replacement := metadata{Version: state.Version, Entries: append([]entry(nil), state.Entries...)}
+	replacement.Entries[index].CachedAt = cachedAt.UTC().Truncate(time.Second).Format(time.RFC3339)
+
+	valueTemporary, err := prepareAtomicWrite(valuePath, value)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(valueTemporary) }()
+
+	content, err := metadataBytes(replacement)
+	if err != nil {
+		return err
+	}
+	metadataTemporary, err := prepareAtomicWrite(filepath.Join(store.root, "metadata.json"), content)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(metadataTemporary) }()
+
+	if err := rename(valueTemporary, valuePath); err != nil {
+		return err
+	}
+	if err := rename(metadataTemporary, filepath.Join(store.root, "metadata.json")); err != nil {
+		if restoreErr := atomicWrite(valuePath, previousValue); restoreErr != nil {
+			return ErrInvalidState
+		}
+		return err
+	}
+	return nil
+}
+
+func (store Store) writeMetadata(state metadata) error {
+	content, err := metadataBytes(state)
+	if err != nil {
+		return err
+	}
 	return atomicWrite(filepath.Join(store.root, "metadata.json"), content)
+}
+
+func metadataBytes(state metadata) ([]byte, error) {
+	content, err := json.Marshal(state)
+	if err != nil {
+		return nil, err
+	}
+	return append(content, '\n'), nil
 }
 
 // Identifier hashes the exact, complete Secret Reference.
@@ -623,30 +728,48 @@ func makePrivateDirectory(path string) error {
 }
 
 func atomicWrite(path string, content []byte) error {
-	directory := filepath.Dir(path)
-	temporary, err := os.CreateTemp(directory, ".temporary-*")
+	temporaryPath, err := prepareAtomicWrite(path, content)
 	if err != nil {
 		return err
 	}
-	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
+	return os.Rename(temporaryPath, path)
+}
+
+func prepareAtomicWrite(path string, content []byte) (string, error) {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".temporary-*")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
 
 	if err := temporary.Chmod(regularFileMode); err != nil {
 		_ = temporary.Close()
-		return err
+		return "", err
 	}
-	if _, err := temporary.Write(content); err != nil {
+	if written, err := temporary.Write(content); err != nil {
 		_ = temporary.Close()
-		return err
+		return "", err
+	} else if written != len(content) {
+		_ = temporary.Close()
+		return "", io.ErrShortWrite
 	}
 	if err := temporary.Sync(); err != nil {
 		_ = temporary.Close()
-		return err
+		return "", err
 	}
 	if err := temporary.Close(); err != nil {
-		return err
+		return "", err
 	}
-	return os.Rename(temporaryPath, path)
+	cleanup = false
+	return temporaryPath, nil
 }
 
 func validTimestamp(value string) bool {

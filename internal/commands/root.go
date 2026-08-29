@@ -45,7 +45,7 @@ func NewRoot(dependencies Dependencies) *cobra.Command {
 	root.SetOut(dependencies.Stdout)
 	root.SetErr(dependencies.Stderr)
 	root.SetVersionTemplate("secrets {{.Version}}\n")
-	root.AddCommand(newCacheCommand(), newGetCommand(dependencies), newStatusCommand(dependencies), newVersionCommand())
+	root.AddCommand(newCacheCommand(dependencies), newGetCommand(dependencies), newStatusCommand(dependencies), newVersionCommand())
 
 	return root
 }
