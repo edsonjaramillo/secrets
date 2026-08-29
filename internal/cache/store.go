@@ -26,6 +26,8 @@ const (
 var (
 	// ErrInvalidState reports cache state that cannot be trusted.
 	ErrInvalidState = errors.New("cache state is invalid")
+	// ErrEntryNotFound reports a requested Cache Entry that does not exist.
+	ErrEntryNotFound = errors.New("cache entry not found")
 	// ErrUnsupportedPlatform reports a platform where ownership cannot be verified.
 	ErrUnsupportedPlatform = errors.New("cache security checks are unsupported on this platform")
 )
@@ -126,6 +128,96 @@ func (store Store) List() ([]ListingEntry, error) {
 	return entries, nil
 }
 
+// Clear removes one Cache Entry without producing output.
+func (store Store) Clear(reference string) error {
+	lock, exists, err := store.acquireLock(true)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrEntryNotFound
+	}
+	defer releaseLock(lock)
+
+	state, err := store.readValidatedMetadata()
+	if err != nil {
+		return err
+	}
+
+	index := -1
+	for current, item := range state.Entries {
+		if item.Reference == reference {
+			index = current
+			break
+		}
+	}
+	if index < 0 {
+		return ErrEntryNotFound
+	}
+
+	remaining := metadata{Version: state.Version, Entries: make([]entry, 0, len(state.Entries)-1)}
+	remaining.Entries = append(remaining.Entries, state.Entries[:index]...)
+	remaining.Entries = append(remaining.Entries, state.Entries[index+1:]...)
+	if err := store.writeMetadata(remaining); err != nil {
+		return err
+	}
+
+	valuePath := filepath.Join(store.root, "values", state.Entries[index].Identifier)
+	if err := os.Remove(valuePath); err != nil {
+		if reconcileErr := store.reconcileMetadata(state); reconcileErr != nil {
+			return reconcileErr
+		}
+		return err
+	}
+	return nil
+}
+
+// ClearAll removes every Cache Entry after validating complete cache state.
+func (store Store) ClearAll() error {
+	return store.clearAll(os.Remove)
+}
+
+// clearAll accepts the removal operation separately so partial-removal recovery
+// can be exercised without changing process-wide filesystem behavior.
+func (store Store) clearAll(remove func(string) error) error {
+	lock, exists, err := store.acquireLock(true)
+	if err != nil || !exists {
+		return err
+	}
+	defer releaseLock(lock)
+
+	state, err := store.readValidatedMetadata()
+	if err != nil {
+		return err
+	}
+	if len(state.Entries) == 0 {
+		return nil
+	}
+
+	entries := append([]entry(nil), state.Entries...)
+	sort.Slice(entries, func(left, right int) bool {
+		return entries[left].Reference < entries[right].Reference
+	})
+	for _, item := range entries {
+		if err := remove(filepath.Join(store.root, "values", item.Identifier)); err != nil {
+			if reconcileErr := store.reconcileMetadata(state); reconcileErr != nil {
+				return reconcileErr
+			}
+			return err
+		}
+	}
+
+	if err := store.writeMetadata(metadata{Version: schemaVersion, Entries: []entry{}}); err != nil {
+		// All value files have already been removed. Keep the index truthful if
+		// replacing it fails after the planned removals.
+		if reconcileErr := store.reconcileMetadata(state); reconcileErr != nil {
+			return reconcileErr
+		}
+		return err
+	}
+	return nil
+}
+
 // Validate verifies complete existing state before cache state is mutated.
 func (store Store) Validate() error {
 	lock, exists, err := store.acquireLock(false)
@@ -150,6 +242,22 @@ func (store Store) readValidatedMetadata() (metadata, error) {
 		return metadata{}, err
 	}
 	return state, nil
+}
+
+func (store Store) reconcileMetadata(state metadata) error {
+	remaining := metadata{Version: state.Version, Entries: make([]entry, 0, len(state.Entries))}
+	for _, item := range state.Entries {
+		path := filepath.Join(store.root, "values", item.Identifier)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || validateInfo(info, false) != nil || info.Size() > MaximumSecretValueSize {
+			return ErrInvalidState
+		}
+		remaining.Entries = append(remaining.Entries, item)
+	}
+	return store.writeMetadata(remaining)
 }
 
 func (store Store) validateValues(state metadata) error {
@@ -225,6 +333,10 @@ func (store Store) Put(reference string, value []byte, cachedAt time.Time) error
 		return state.Entries[left].Reference < state.Entries[right].Reference
 	})
 
+	return store.writeMetadata(state)
+}
+
+func (store Store) writeMetadata(state metadata) error {
 	content, err := json.Marshal(state)
 	if err != nil {
 		return err

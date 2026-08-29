@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -17,7 +18,7 @@ func newCacheCommand() *cobra.Command {
 			return command.Help()
 		},
 	}
-	command.AddCommand(newCacheListCommand())
+	command.AddCommand(newCacheListCommand(), newCacheClearCommand())
 	return command
 }
 
@@ -30,6 +31,51 @@ func newCacheListCommand() *cobra.Command {
 			return runCacheList(command.OutOrStdout())
 		},
 	}
+}
+
+func newCacheClearCommand() *cobra.Command {
+	var all bool
+	command := &cobra.Command{
+		Use:   "clear [reference]",
+		Short: "Logically remove Cache Entries",
+		Long:  "Logically remove one Cache Entry or all Cache Entries. This does not guarantee secure erasure from storage media, journals, snapshots, or backups.",
+		Args: func(_ *cobra.Command, args []string) error {
+			if all {
+				if len(args) != 0 {
+					return errors.New("accepts either one Secret Reference or --all")
+				}
+				return nil
+			}
+			if len(args) != 1 {
+				return errors.New("requires exactly one Secret Reference or --all")
+			}
+			if !validSecretReference(args[0]) {
+				return errors.New("invalid Secret Reference")
+			}
+			return nil
+		},
+		RunE: func(_ *cobra.Command, args []string) error {
+			return runCacheClear(args, all)
+		},
+	}
+	command.Flags().BoolVar(&all, "all", false, "Remove all Cache Entries")
+	return command
+}
+
+func runCacheClear(args []string, all bool) error {
+	store, err := cache.NewStore()
+	if err != nil {
+		return cacheFailure(err)
+	}
+	if all {
+		err = store.ClearAll()
+	} else {
+		err = store.Clear(args[0])
+	}
+	if err != nil {
+		return cacheFailure(err)
+	}
+	return nil
 }
 
 func runCacheList(stdout io.Writer) error {

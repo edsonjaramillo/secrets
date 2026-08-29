@@ -91,6 +91,9 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 }
 
 func cacheFailure(err error) error {
+	if errors.Is(err, cache.ErrEntryNotFound) {
+		return errors.New("cache entry not found")
+	}
 	if errors.Is(err, cache.ErrInvalidState) {
 		return errors.New("cache state is invalid; inspect and remove the cache directory manually")
 	}

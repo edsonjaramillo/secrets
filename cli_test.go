@@ -747,6 +747,177 @@ func TestCacheList(t *testing.T) {
 	}
 }
 
+func TestCacheClear(t *testing.T) {
+	binary := buildCLI(t, "")
+
+	t.Run("requires exactly one Secret Reference or --all before touching state", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"cache", "clear"},
+			{"cache", "clear", "--all", "op://vault/item/field"},
+			{"cache", "clear", "op://vault/item/field", "--all"},
+			{"cache", "clear", "op://vault/one/field", "op://vault/two/field"},
+			{"cache", "clear", "not-a-reference"},
+		} {
+			environment := isolatedEnvironment(t)
+			got := runCLI(t, binary, environment, args...)
+			if got.err == nil || got.stdout != "" || !strings.HasPrefix(got.stderr, "Error: ") {
+				t.Errorf("arguments %v were not a concise failure: %+v", args, got)
+			}
+			assertDirectoryEmpty(t, environment.cache)
+			assertNotInvoked(t, environment)
+		}
+	})
+
+	t.Run("help describes logical removal without secure-erasure claims", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		got := runCLI(t, binary, environment, "cache", "clear", "--help")
+
+		if got.err != nil || got.stderr != "" {
+			t.Fatalf("clear help failed: %+v", got)
+		}
+		for _, phrase := range []string{"logical", "secure", "storage media", "snapshots", "backups"} {
+			if !strings.Contains(strings.ToLower(got.stdout), phrase) {
+				t.Errorf("clear help does not contain %q: %q", phrase, got.stdout)
+			}
+		}
+	})
+
+	t.Run("unknown individual entries fail without mutation", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/item/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before unknown clear: %v", err)
+		}
+
+		got := runCLI(t, binary, environment, "cache", "clear", "op://vault/missing/field")
+
+		assertResult(t, got, "", "Error: cache entry not found\n", true)
+		afterMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after unknown clear: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, afterMetadata) {
+			t.Error("unknown clear changed metadata")
+		}
+		if _, err := os.Stat(filepath.Join(root, "values", referenceIdentifier(reference))); err != nil {
+			t.Fatalf("unknown clear removed known value: %v", err)
+		}
+	})
+
+	t.Run("single clear removes the Cache Entry and forces the next get to miss", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/item/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+
+		got := runCLI(t, binary, environment, "cache", "clear", reference)
+
+		assertResult(t, got, "", "", false)
+		metadata := readCacheMetadata(t, root)
+		if len(metadata.Entries) != 0 {
+			t.Fatalf("clear retained metadata entries: %+v", metadata.Entries)
+		}
+		if _, err := os.Stat(filepath.Join(root, "values", referenceIdentifier(reference))); !os.IsNotExist(err) {
+			t.Errorf("clear retained value: %v", err)
+		}
+		resetInvocation(t, environment)
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		if _, err := os.Stat(filepath.Join(environment.fakeBin, "op-invoked")); err != nil {
+			t.Fatalf("next get did not invoke op after clear: %v", err)
+		}
+	})
+
+	t.Run("clear --all removes every Cache Entry silently", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		references := []string{"op://vault/first/field", "op://vault/second/field"}
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+
+		got := runCLI(t, binary, environment, "cache", "clear", "--all")
+
+		assertResult(t, got, "", "", false)
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		if len(metadata.Entries) != 0 {
+			t.Fatalf("clear --all retained metadata entries: %+v", metadata.Entries)
+		}
+		entries, err := os.ReadDir(filepath.Join(cacheRoot(environment), "values"))
+		if err != nil {
+			t.Fatalf("read values after clear --all: %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("clear --all retained value files: %v", entries)
+		}
+	})
+
+	t.Run("absent and empty clear --all commands succeed without creating state", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		assertResult(t, runCLI(t, binary, environment, "cache", "clear", "--all"), "", "", false)
+		assertDirectoryEmpty(t, environment.cache)
+
+		createEmptyCache(t, environment)
+		before, err := os.ReadFile(filepath.Join(cacheRoot(environment), "metadata.json"))
+		if err != nil {
+			t.Fatalf("read empty metadata before clear --all: %v", err)
+		}
+		assertResult(t, runCLI(t, binary, environment, "cache", "clear", "--all"), "", "", false)
+		after, err := os.ReadFile(filepath.Join(cacheRoot(environment), "metadata.json"))
+		if err != nil {
+			t.Fatalf("read empty metadata after clear --all: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Error("empty clear --all changed metadata")
+		}
+	})
+
+	t.Run("clear --all validates complete state before removing anything", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		references := []string{"op://vault/first/field", "op://vault/second/field"}
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+		root := cacheRoot(environment)
+		metadataBefore, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before corruption: %v", err)
+		}
+		valuePath := filepath.Join(root, "values", referenceIdentifier(references[1]))
+		if err := os.Remove(valuePath); err != nil {
+			t.Fatalf("remove value for corruption: %v", err)
+		}
+		firstValuePath := filepath.Join(root, "values", referenceIdentifier(references[0]))
+		valueBefore, err := os.ReadFile(firstValuePath)
+		if err != nil {
+			t.Fatalf("read unaffected value before clear: %v", err)
+		}
+
+		got := runCLI(t, binary, environment, "cache", "clear", "--all")
+
+		assertResult(t, got, "", "Error: cache state is invalid; inspect and remove the cache directory manually\n", true)
+		metadataAfter, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after rejected clear: %v", err)
+		}
+		if !bytes.Equal(metadataBefore, metadataAfter) {
+			t.Error("corrupt clear --all changed metadata")
+		}
+		valueAfter, err := os.ReadFile(firstValuePath)
+		if err != nil {
+			t.Fatalf("read unaffected value after rejected clear: %v", err)
+		}
+		if !bytes.Equal(valueBefore, valueAfter) {
+			t.Error("corrupt clear --all changed an unaffected value")
+		}
+	})
+}
+
 func createEmptyCache(t *testing.T, environment testEnvironment) {
 	t.Helper()
 	root := cacheRoot(environment)
