@@ -2,6 +2,9 @@ package main_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -254,6 +257,181 @@ func TestGet(t *testing.T) {
 			t.Errorf("interactive cancellation took %s", elapsed)
 		}
 	})
+}
+
+func TestGetCache(t *testing.T) {
+	binary := buildCLI(t, "")
+
+	t.Run("a miss retains a schema-versioned Cache Entry with protected files", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-binary")
+		reference := "op://vault/item/field"
+		before := time.Now().UTC().Add(-time.Second)
+
+		got := runCLIWithUmask(t, binary, environment, "get", reference)
+
+		assertSecretResult(t, got, []byte{0xff, 0x00, 'A', '\n'})
+		root := cacheRoot(environment)
+		identifier := referenceIdentifier(reference)
+		metadata := readCacheMetadata(t, root)
+		if metadata.Version != 1 || len(metadata.Entries) != 1 {
+			t.Fatalf("unexpected metadata header or entry count: %+v", metadata)
+		}
+		entry := metadata.Entries[0]
+		if entry.Reference != reference || entry.Identifier != identifier {
+			t.Errorf("metadata did not preserve exact identity: %+v", entry)
+		}
+		cachedAt, err := time.Parse(time.RFC3339, entry.CachedAt)
+		if err != nil || cachedAt.Before(before) || cachedAt.After(time.Now().UTC().Add(time.Second)) || cachedAt.Location() != time.UTC {
+			t.Errorf("invalid successful UTC cache timestamp %q", entry.CachedAt)
+		}
+		value, err := os.ReadFile(filepath.Join(root, "values", identifier))
+		if err != nil {
+			t.Fatalf("read retained Secret Value: %v", err)
+		}
+		if !bytes.Equal(value, []byte{0xff, 0x00, 'A', '\n'}) {
+			t.Error("retained Secret Value bytes differ")
+		}
+		metadataBytes, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata bytes: %v", err)
+		}
+		if bytes.Contains(metadataBytes, value) {
+			t.Error("Secret Value entered metadata")
+		}
+		assertMode(t, root, 0o700)
+		assertMode(t, filepath.Join(root, "values"), 0o700)
+		assertMode(t, filepath.Join(root, "metadata.json"), 0o600)
+		assertMode(t, filepath.Join(root, "cache.lock"), 0o600)
+		assertMode(t, filepath.Join(root, "values", identifier), 0o600)
+		assertNoTemporaryFiles(t, root)
+		assertNoTemporaryFiles(t, filepath.Join(root, "values"))
+	})
+
+	t.Run("a hit emits exact bytes without invoking op or changing metadata", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/item/field"
+		first := runCLI(t, binary, environment, "get", reference)
+		assertSecretResult(t, first, []byte("opaque value\nwith trailing newline\n"))
+		root := cacheRoot(environment)
+		before, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read initial metadata: %v", err)
+		}
+		if err := os.Remove(filepath.Join(environment.fakeBin, "op")); err != nil {
+			t.Fatalf("remove fake op: %v", err)
+		}
+		if err := os.Remove(filepath.Join(environment.fakeBin, "op-invoked")); err != nil {
+			t.Fatalf("remove invocation marker: %v", err)
+		}
+
+		second := runCLI(t, binary, environment, "get", reference)
+
+		assertSecretResult(t, second, []byte("opaque value\nwith trailing newline\n"))
+		after, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after hit: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Error("cache hit changed the cache timestamp")
+		}
+		assertNotInvoked(t, environment)
+	})
+
+	t.Run("textually different references retain different Cache Entries", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		references := []string{"op://vault/item/field", "op://vault/item/field?attribute=value"}
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		if len(metadata.Entries) != 2 || metadata.Entries[0].Identifier == metadata.Entries[1].Identifier {
+			t.Errorf("different exact references did not create distinct entries: %+v", metadata.Entries)
+		}
+		for _, reference := range references {
+			if _, err := os.Stat(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(reference))); err != nil {
+				t.Errorf("missing value for distinct reference: %v", err)
+			}
+		}
+	})
+
+	t.Run("a miss validates existing state before contacting op", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		root := cacheRoot(environment)
+		if err := os.MkdirAll(filepath.Join(root, "values"), 0o700); err != nil {
+			t.Fatalf("create malformed cache: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte("not json"), 0o600); err != nil {
+			t.Fatalf("write malformed metadata: %v", err)
+		}
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+
+		got := runCLI(t, binary, environment, "get", "op://vault/new/field")
+
+		assertControlledGetFailure(t, got, "Error: cache state is invalid\n")
+		assertNotInvoked(t, environment)
+	})
+}
+
+type cacheMetadata struct {
+	Version int `json:"version"`
+	Entries []struct {
+		Reference  string `json:"reference"`
+		Identifier string `json:"identifier"`
+		CachedAt   string `json:"cached_at"`
+	} `json:"entries"`
+}
+
+func readCacheMetadata(t *testing.T, root string) cacheMetadata {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read cache metadata: %v", err)
+	}
+	var metadata cacheMetadata
+	if err := json.Unmarshal(content, &metadata); err != nil {
+		t.Fatalf("parse cache metadata: %v", err)
+	}
+	return metadata
+}
+
+func cacheRoot(environment testEnvironment) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(environment.home, "Library", "Caches", "secrets")
+	}
+	return filepath.Join(environment.cache, "secrets")
+}
+
+func referenceIdentifier(reference string) string {
+	digest := sha256.Sum256([]byte(reference))
+	return hex.EncodeToString(digest[:])
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Errorf("mode for %s: want %04o, got %04o", path, want, got)
+	}
+}
+
+func assertNoTemporaryFiles(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".temporary-") {
+			t.Errorf("atomic write left temporary file %s", entry.Name())
+		}
+	}
 }
 
 func TestStatus(t *testing.T) {
@@ -529,7 +707,17 @@ func buildCLI(t *testing.T, version string) string {
 func runCLI(t *testing.T, binary string, environment testEnvironment, args ...string) result {
 	t.Helper()
 
-	command := exec.Command(binary, args...)
+	return runCommand(exec.Command(binary, args...), environment)
+}
+
+func runCLIWithUmask(t *testing.T, binary string, environment testEnvironment, args ...string) result {
+	t.Helper()
+
+	commandArgs := append([]string{"-c", `umask 0777; exec "$@"`, "sh", binary}, args...)
+	return runCommand(exec.Command("/bin/sh", commandArgs...), environment)
+}
+
+func runCommand(command *exec.Cmd, environment testEnvironment) result {
 	command.Env = environment.variables
 	command.Stdin = bytes.NewReader(nil)
 	var stdout bytes.Buffer

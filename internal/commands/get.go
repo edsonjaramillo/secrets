@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/edsonjaramillo/secrets/internal/cache"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +31,25 @@ func newGetCommand(dependencies Dependencies) *cobra.Command {
 func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies, reference string) error {
 	if !validSecretReference(reference) {
 		return errors.New("invalid Secret Reference")
+	}
+
+	store, err := cache.NewStore()
+	if err != nil {
+		return errors.New("cache operation failed")
+	}
+	cachedValue, found, err := store.Lookup(reference)
+	if err != nil {
+		return cacheFailure(err)
+	}
+	if found {
+		if len(cachedValue) > maximumSecretValueSize {
+			return errors.New("cache state is invalid")
+		}
+		_, err = stdout.Write(cachedValue)
+		return err
+	}
+	if err := store.Validate(); err != nil {
+		return cacheFailure(err)
 	}
 
 	ctx := parent
@@ -68,8 +88,18 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 		return errors.New("secret value exceeds the 16 MiB limit")
 	}
 
+	if err := store.Put(reference, value.content.Bytes(), time.Now()); err != nil {
+		return cacheFailure(err)
+	}
 	_, err = stdout.Write(value.content.Bytes())
 	return err
+}
+
+func cacheFailure(err error) error {
+	if errors.Is(err, cache.ErrInvalidState) {
+		return errors.New("cache state is invalid")
+	}
+	return errors.New("cache operation failed")
 }
 
 func validSecretReference(reference string) bool {
