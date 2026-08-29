@@ -1,7 +1,15 @@
 package main
 
-import "github.com/edsonjaramillo/secrets/cmd"
+import (
+	"os"
+
+	"github.com/edsonjaramillo/secrets/internal/commands"
+)
 
 func main() {
-	cmd.Execute()
+	os.Exit(commands.Run(commands.Dependencies{
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}))
 }

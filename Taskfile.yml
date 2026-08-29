@@ -5,12 +5,13 @@ vars:
   BIN_DIR: ~/.local/bin
   EXECUTABLE: secrets
   VERSION: dev
+  MAIN: .
 
 tasks:
   build:
     cmds:
       - mkdir -p {{.BIN_DIR}}
-      - go build -ldflags="-s -w -X secrets/internal/commands.Version={{.VERSION}}" -o {{.BIN_DIR}}/{{.EXECUTABLE}} {{.MAIN}}
+      - go build -ldflags="-s -w -X github.com/edsonjaramillo/secrets/internal/commands.Version={{.VERSION}}" -o {{.BIN_DIR}}/{{.EXECUTABLE}} {{.MAIN}}
     silent: true
   test:
     cmd: go test ./...
