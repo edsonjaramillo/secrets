@@ -927,7 +927,8 @@ func TestCacheRevalidate(t *testing.T) {
 			{"cache", "revalidate"},
 			{"cache", "revalidate", "op://vault/one/field", "op://vault/two/field"},
 			{"cache", "revalidate", "not-a-reference"},
-			{"cache", "revalidate", "--all"},
+			{"cache", "revalidate", "--all", "op://vault/item/field"},
+			{"cache", "revalidate", "op://vault/item/field", "--all"},
 		} {
 			environment := isolatedEnvironment(t)
 			got := runCLI(t, binary, environment, args...)
@@ -1138,6 +1139,232 @@ func TestCacheRevalidate(t *testing.T) {
 	})
 }
 
+func TestCacheRevalidateAll(t *testing.T) {
+	binary := buildCLI(t, "")
+	references := []string{
+		"op://vault/zeta/field",
+		"op://vault/alpha/field",
+		"op://vault/middle/field",
+	}
+
+	t.Run("absent and empty caches succeed silently without invoking op", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		assertResult(t, runCLI(t, binary, environment, "cache", "revalidate", "--all"), "", "", false)
+		assertDirectoryEmpty(t, environment.cache)
+
+		createEmptyCache(t, environment)
+		assertResult(t, runCLI(t, binary, environment, "cache", "revalidate", "--all"), "", "", false)
+		assertNotInvoked(t, environment)
+	})
+
+	t.Run("revalidates every entry once in lexical order", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+		root := cacheRoot(environment)
+		metadata := readCacheMetadata(t, root)
+		for index := range metadata.Entries {
+			metadata.Entries[index].CachedAt = "2020-01-02T03:04:05Z"
+		}
+		writeCacheMetadata(t, root, metadata)
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "bulk-success")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", "--all")
+
+		assertResult(t, got, "", "", false)
+		invocations := readInvocation(t, environment)
+		if strings.Count(invocations, "whoami|") != 1 {
+			t.Errorf("bulk revalidation authenticated %d times", strings.Count(invocations, "whoami|"))
+		}
+		lastPosition := -1
+		for _, reference := range []string{
+			"op://vault/alpha/field",
+			"op://vault/middle/field",
+			"op://vault/zeta/field",
+		} {
+			position := strings.Index(invocations, "read --no-newline "+reference)
+			if position < 0 || position <= lastPosition {
+				t.Errorf("bulk reads were not in lexical order: %q", invocations)
+			}
+			lastPosition = position
+		}
+
+		wantValues := map[string][]byte{
+			"op://vault/alpha/field":  []byte("alpha replacement\n"),
+			"op://vault/middle/field": []byte("middle replacement\n"),
+			"op://vault/zeta/field":   []byte("zeta replacement\n"),
+		}
+		updated := readCacheMetadata(t, root)
+		for _, entry := range updated.Entries {
+			if entry.CachedAt == "2020-01-02T03:04:05Z" {
+				t.Errorf("successful entry %q did not receive a new timestamp", entry.Reference)
+			}
+			value, err := os.ReadFile(filepath.Join(root, "values", entry.Identifier))
+			if err != nil {
+				t.Fatalf("read revalidated value: %v", err)
+			}
+			if !bytes.Equal(value, wantValues[entry.Reference]) {
+				t.Errorf("value for %q = %q, want %q", entry.Reference, value, wantValues[entry.Reference])
+			}
+		}
+	})
+
+	t.Run("reports mixed retrieval failures and preserves failed entries", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+		root := cacheRoot(environment)
+		metadata := readCacheMetadata(t, root)
+		for index := range metadata.Entries {
+			metadata.Entries[index].CachedAt = "2020-01-02T03:04:05Z"
+		}
+		writeCacheMetadata(t, root, metadata)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before mixed revalidation: %v", err)
+		}
+		beforeValues := make(map[string][]byte, len(references))
+		for _, reference := range references {
+			identifier := referenceIdentifier(reference)
+			beforeValues[reference], err = os.ReadFile(filepath.Join(root, "values", identifier))
+			if err != nil {
+				t.Fatalf("read value before mixed revalidation: %v", err)
+			}
+		}
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "bulk-mixed")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", "--all")
+
+		failure := referenceIdentifier("op://vault/middle/field")
+		wantStderr := "Error: cache entry " + failure + " failed to revalidate: 1Password command failed with exit code 23\n" +
+			"1 cache entry failed to revalidate\n"
+		assertResult(t, got, "", wantStderr, true)
+		for _, forbidden := range references {
+			if strings.Contains(got.stderr, forbidden) {
+				t.Errorf("bulk failure exposed Secret Reference %q", forbidden)
+			}
+		}
+		for _, forbidden := range []string{"private partial Secret Value", "private retrieval diagnostic"} {
+			if strings.Contains(got.stderr, forbidden) {
+				t.Errorf("bulk failure exposed private subprocess content %q", forbidden)
+			}
+		}
+		invocations := readInvocation(t, environment)
+		if strings.Count(invocations, "read --no-newline ") != len(references) || strings.Count(invocations, "whoami|") != 1 {
+			t.Errorf("bulk revalidation stopped after a retrieval failure: %q", invocations)
+		}
+
+		metadataAfter, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after mixed revalidation: %v", err)
+		}
+		if bytes.Equal(beforeMetadata, metadataAfter) {
+			t.Error("successful mixed revalidations did not update metadata")
+		}
+		for _, reference := range references {
+			value, err := os.ReadFile(filepath.Join(root, "values", referenceIdentifier(reference)))
+			if err != nil {
+				t.Fatalf("read value after mixed revalidation: %v", err)
+			}
+			if reference == "op://vault/middle/field" {
+				if !bytes.Equal(value, beforeValues[reference]) {
+					t.Errorf("failed value changed: %q", value)
+				}
+				continue
+			}
+			if bytes.Equal(value, beforeValues[reference]) {
+				t.Errorf("successful value for %q was not replaced", reference)
+			}
+		}
+	})
+
+	t.Run("reports every retrieval failure and preserves the complete cache", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before failed bulk revalidation: %v", err)
+		}
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "bulk-fail")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", "--all")
+
+		if got.stdout != "" || got.err == nil {
+			t.Errorf("failed bulk revalidation result: %+v", got)
+		}
+		for _, reference := range references {
+			identifier := referenceIdentifier(reference)
+			if !strings.Contains(got.stderr, "cache entry "+identifier+" failed to revalidate: 1Password command failed with exit code 23") {
+				t.Errorf("missing controlled failure for %s: %q", identifier, got.stderr)
+			}
+			if strings.Contains(got.stderr, reference) || strings.Contains(got.stderr, "private partial Secret Value") {
+				t.Errorf("bulk failure exposed private data for %s", identifier)
+			}
+		}
+		if !strings.Contains(got.stderr, "3 cache entries failed to revalidate") {
+			t.Errorf("missing failure-count summary: %q", got.stderr)
+		}
+		metadataAfter, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after failed bulk revalidation: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, metadataAfter) {
+			t.Error("all failed revalidations changed metadata")
+		}
+		if strings.Count(readInvocation(t, environment), "read --no-newline ") != len(references) {
+			t.Error("not every entry was attempted after retrieval failures")
+		}
+	})
+
+	t.Run("authentication failure is reported for every entry without reads", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		for _, reference := range references[:2] {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+		root := cacheRoot(environment)
+		beforeMetadata, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata before authentication failure: %v", err)
+		}
+		resetInvocation(t, environment)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "bulk-auth-failure")
+
+		got := runCLI(t, binary, environment, "cache", "revalidate", "--all")
+
+		if got.stdout != "" || got.err == nil {
+			t.Errorf("authentication failure result: %+v", got)
+		}
+		for _, reference := range references[:2] {
+			identifier := referenceIdentifier(reference)
+			if !strings.Contains(got.stderr, "cache entry "+identifier+" failed to revalidate: authentication required; run `op signin` or enable 1Password desktop-app CLI integration") {
+				t.Errorf("missing authentication failure for %s: %q", identifier, got.stderr)
+			}
+		}
+		if strings.Count(readInvocation(t, environment), "whoami|") != 1 || strings.Contains(readInvocation(t, environment), "read --no-newline") {
+			t.Errorf("authentication failure did not stop reads after one preflight: %q", readInvocation(t, environment))
+		}
+		metadataAfter, err := os.ReadFile(filepath.Join(root, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata after authentication failure: %v", err)
+		}
+		if !bytes.Equal(beforeMetadata, metadataAfter) {
+			t.Error("authentication failure changed metadata")
+		}
+	})
+}
+
 func setEnvironmentVariable(environment *testEnvironment, name, value string) {
 	prefix := name + "="
 	for index, variable := range environment.variables {
@@ -1310,6 +1537,41 @@ case "$1:$FAKE_OP_MODE" in
     ;;
   whoami:revalidate-*)
     exit 0
+    ;;
+  whoami:bulk-auth-failure)
+    echo 'account@example.com'
+    echo 'You are not currently signed in. private authentication diagnostic' >&2
+    exit 1
+    ;;
+  whoami:bulk-*)
+    exit 0
+    ;;
+  read:bulk-success)
+    case "$3" in
+      op://vault/alpha/field) printf 'alpha replacement\n' ;;
+      op://vault/middle/field) printf 'middle replacement\n' ;;
+      op://vault/zeta/field) printf 'zeta replacement\n' ;;
+      *) exit 23 ;;
+    esac
+    exit 0
+    ;;
+  read:bulk-mixed)
+    case "$3" in
+      op://vault/middle/field)
+        printf 'private partial Secret Value'
+        echo 'private retrieval diagnostic' >&2
+        exit 23
+        ;;
+      op://vault/alpha/field) printf 'alpha replacement\n' ;;
+      op://vault/zeta/field) printf 'zeta replacement\n' ;;
+      *) exit 23 ;;
+    esac
+    exit 0
+    ;;
+  read:bulk-fail)
+    printf 'private partial Secret Value'
+    echo 'private retrieval diagnostic' >&2
+    exit 23
     ;;
   read:get-exact)
     printf 'opaque value\nwith trailing newline\n'

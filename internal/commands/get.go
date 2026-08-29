@@ -72,9 +72,17 @@ func onePasswordContext(parent context.Context, dependencies Dependencies) (cont
 }
 
 func retrieveSecretValue(ctx context.Context, dependencies Dependencies, reference string) ([]byte, error) {
+	path, err := authenticate(ctx, dependencies)
+	if err != nil {
+		return nil, err
+	}
+	return readSecretValue(ctx, dependencies, path, reference)
+}
+
+func authenticate(ctx context.Context, dependencies Dependencies) (string, error) {
 	path, err := exec.LookPath("op")
 	if err != nil {
-		return nil, errors.New("1Password CLI is not installed")
+		return "", errors.New("1Password CLI is not installed")
 	}
 
 	var probeOutput, probeDiagnostic limitedBuffer
@@ -84,9 +92,12 @@ func retrieveSecretValue(ctx context.Context, dependencies Dependencies, referen
 	probe.Stdout = &probeOutput
 	probe.Stderr = &probeDiagnostic
 	if err := probe.Run(); err != nil {
-		return nil, classifyOnePasswordFailure(ctx, err, probeOutput.String()+"\n"+probeDiagnostic.String(), true)
+		return "", classifyOnePasswordFailure(ctx, err, probeOutput.String()+"\n"+probeDiagnostic.String(), true)
 	}
+	return path, nil
+}
 
+func readSecretValue(ctx context.Context, dependencies Dependencies, path, reference string) ([]byte, error) {
 	var value boundedSecretBuffer
 	var diagnostic limitedBuffer
 	read := exec.CommandContext(ctx, path, "read", "--no-newline", reference)
