@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -537,7 +538,7 @@ func (store Store) readMetadata() (metadata, bool, error) {
 	}
 
 	content, err := os.ReadFile(filepath.Join(store.root, "metadata.json"))
-	if err != nil {
+	if err != nil || !utf8.Valid(content) {
 		return metadata{}, false, ErrInvalidState
 	}
 

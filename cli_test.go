@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/spf13/cobra"
 )
 
 const rootHelp = `Retrieve and cache 1Password Secret Values
@@ -1387,6 +1389,196 @@ func createEmptyCache(t *testing.T, environment testEnvironment) {
 	}
 	if err := os.WriteFile(filepath.Join(root, "metadata.json"), []byte("{\"version\":1,\"entries\":[]}\n"), 0o600); err != nil {
 		t.Fatalf("create empty cache metadata: %v", err)
+	}
+}
+
+func TestCompletion(t *testing.T) {
+	binary := buildCLI(t, "")
+
+	t.Run("generates scripts for every supported shell", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		for _, test := range []struct {
+			shell  string
+			marker string
+		}{
+			{shell: "bash", marker: "# bash completion V2 for secrets"},
+			{shell: "zsh", marker: "#compdef secrets"},
+			{shell: "fish", marker: "# fish completion for secrets"},
+			{shell: "powershell", marker: "# powershell completion for secrets"},
+		} {
+			t.Run(test.shell, func(t *testing.T) {
+				got := runCLI(t, binary, environment, "completion", test.shell)
+				if got.err != nil || got.stderr != "" || !strings.Contains(got.stdout, test.marker) {
+					t.Errorf("completion output for %s = %+v", test.shell, got)
+				}
+			})
+		}
+		assertDirectoryEmpty(t, environment.cache)
+	})
+
+	t.Run("completes exact cached Secret References for administrative commands", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		references := []string{
+			"op://vault/ordinary item/field",
+			"op://vault/日本語 item/field",
+		}
+		for _, reference := range references {
+			assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		}
+
+		for _, test := range []struct {
+			name       string
+			command    string
+			toComplete string
+			want       string
+		}{
+			{
+				name:       "clear with an ordinary-space prefix",
+				command:    "clear",
+				toComplete: "op://vault/ordinary ",
+				want:       "op://vault/ordinary item/field",
+			},
+			{
+				name:       "revalidate with a Unicode prefix",
+				command:    "revalidate",
+				toComplete: "op://vault/日本",
+				want:       "op://vault/日本語 item/field",
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				got := runCLI(t, binary, environment, "__complete", "cache", test.command, test.toComplete)
+				assertCompletion(t, got, []string{test.want})
+			})
+		}
+
+		all := runCLI(t, binary, environment, "__complete", "cache", "clear", "")
+		assertCompletion(t, all, references)
+		if strings.Contains(all.stdout+all.stderr, "opaque value") {
+			t.Error("completion exposed a Secret Value")
+		}
+	})
+
+	t.Run("does not complete get references or allow filename completion", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		got := runCLI(t, binary, environment, "__complete", "get", "")
+		assertCompletion(t, got, nil)
+		assertNotInvoked(t, environment)
+	})
+
+	t.Run("does not complete after --all", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", "op://vault/item/field"), []byte("opaque value\nwith trailing newline\n"))
+
+		got := runCLI(t, binary, environment, "__complete", "cache", "clear", "--all", "")
+		assertCompletion(t, got, nil)
+	})
+
+	t.Run("fails closed for malformed UTF-8 metadata", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/item/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+
+		decodedReference := "op://vault/\ufffd/item/field"
+		root := cacheRoot(environment)
+		if err := os.Rename(
+			filepath.Join(root, "values", referenceIdentifier(reference)),
+			filepath.Join(root, "values", referenceIdentifier(decodedReference)),
+		); err != nil {
+			t.Fatalf("rename value for malformed metadata: %v", err)
+		}
+		metadata := []byte(`{"version":1,"entries":[{"reference":"op://vault/`)
+		metadata = append(metadata, 0xff)
+		metadata = append(metadata, []byte(`/item/field","identifier":"`+referenceIdentifier(decodedReference)+`","cached_at":"2026-01-02T03:04:05Z"}]}`)...)
+		if err := os.WriteFile(filepath.Join(root, "metadata.json"), metadata, 0o600); err != nil {
+			t.Fatalf("write malformed UTF-8 metadata: %v", err)
+		}
+
+		got := runCLI(t, binary, environment, "__complete", "cache", "clear", "")
+		assertCompletion(t, got, nil)
+	})
+
+	t.Run("fails closed when metadata is malformed", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+		reference := "op://vault/item/field"
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		if err := os.WriteFile(filepath.Join(cacheRoot(environment), "metadata.json"), []byte("not json"), 0o600); err != nil {
+			t.Fatalf("malform cache metadata: %v", err)
+		}
+
+		got := runCLI(t, binary, environment, "__complete", "cache", "clear", "")
+		assertCompletion(t, got, nil)
+	})
+
+	t.Run("fails closed for missing or unreadable metadata", func(t *testing.T) {
+		for _, test := range []struct {
+			name    string
+			corrupt func(*testing.T, string)
+		}{
+			{
+				name: "missing metadata",
+				corrupt: func(t *testing.T, root string) {
+					if err := os.Remove(filepath.Join(root, "metadata.json")); err != nil {
+						t.Fatalf("remove cache metadata: %v", err)
+					}
+				},
+			},
+			{
+				name: "unsafe metadata permissions",
+				corrupt: func(t *testing.T, root string) {
+					if err := os.Chmod(filepath.Join(root, "metadata.json"), 0o644); err != nil {
+						t.Fatalf("make cache metadata unsafe: %v", err)
+					}
+				},
+			},
+			{
+				name: "unreadable metadata",
+				corrupt: func(t *testing.T, root string) {
+					if err := os.Chmod(filepath.Join(root, "metadata.json"), 0o000); err != nil {
+						t.Fatalf("make cache metadata unreadable: %v", err)
+					}
+				},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				environment := isolatedEnvironment(t)
+				environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+				reference := "op://vault/item/field"
+				assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+				test.corrupt(t, cacheRoot(environment))
+
+				got := runCLI(t, binary, environment, "__complete", "cache", "clear", "")
+				assertCompletion(t, got, nil)
+			})
+		}
+	})
+}
+
+func assertCompletion(t *testing.T, got result, want []string) {
+	t.Helper()
+
+	if got.err != nil {
+		t.Fatalf("completion failed: %v", got.err)
+	}
+	if got.stderr != "Completion ended with directive: ShellCompDirectiveNoFileComp\n" {
+		t.Errorf("completion stderr = %q", got.stderr)
+	}
+	lines := strings.Split(strings.TrimSuffix(got.stdout, "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	} else if len(lines) == 0 || lines[len(lines)-1] != fmt.Sprintf(":%d", cobra.ShellCompDirectiveNoFileComp) {
+		t.Fatalf("completion output = %q, want directive :%d", got.stdout, cobra.ShellCompDirectiveNoFileComp)
+	} else {
+		lines = lines[:len(lines)-1]
+		if len(lines) == 0 {
+			lines = nil
+		}
+	}
+	if !reflect.DeepEqual(lines, want) {
+		t.Errorf("completion candidates = %q, want %q", lines, want)
 	}
 }
 

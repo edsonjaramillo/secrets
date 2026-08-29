@@ -17,9 +17,10 @@ import (
 
 func newGetCommand(dependencies Dependencies) *cobra.Command {
 	return &cobra.Command{
-		Use:   "get <reference>",
-		Short: "Retrieve a Secret Value",
-		Args:  cobra.ExactArgs(1),
+		Use:               "get <reference>",
+		Short:             "Retrieve a Secret Value",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: cobra.NoFileCompletions,
 		RunE: func(command *cobra.Command, args []string) error {
 			return runGet(command.Context(), command.OutOrStdout(), dependencies, args[0])
 		},

@@ -39,9 +39,10 @@ func newCacheListCommand() *cobra.Command {
 func newCacheClearCommand() *cobra.Command {
 	var all bool
 	command := &cobra.Command{
-		Use:   "clear [reference]",
-		Short: "Logically remove Cache Entries",
-		Long:  "Logically remove one Cache Entry or all Cache Entries. This does not guarantee secure erasure from storage media, journals, snapshots, or backups.",
+		Use:               "clear [reference]",
+		Short:             "Logically remove Cache Entries",
+		Long:              "Logically remove one Cache Entry or all Cache Entries. This does not guarantee secure erasure from storage media, journals, snapshots, or backups.",
+		ValidArgsFunction: completeCachedSecretReferences,
 		Args: func(_ *cobra.Command, args []string) error {
 			if all {
 				if len(args) != 0 {
@@ -68,8 +69,9 @@ func newCacheClearCommand() *cobra.Command {
 func newCacheRevalidateCommand(dependencies Dependencies) *cobra.Command {
 	var all bool
 	command := &cobra.Command{
-		Use:   "revalidate [reference]",
-		Short: "Replace existing Cache Entries",
+		Use:               "revalidate [reference]",
+		Short:             "Replace existing Cache Entries",
+		ValidArgsFunction: completeCachedSecretReferences,
 		Args: func(_ *cobra.Command, args []string) error {
 			if all {
 				if len(args) != 0 {
@@ -94,6 +96,30 @@ func newCacheRevalidateCommand(dependencies Dependencies) *cobra.Command {
 	}
 	command.Flags().BoolVar(&all, "all", false, "Replace all Cache Entries")
 	return command
+}
+
+func completeCachedSecretReferences(command *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	const noFileCompletion = cobra.ShellCompDirectiveNoFileComp
+	if len(args) != 0 || command.Flags().Changed("all") {
+		return nil, noFileCompletion
+	}
+
+	store, err := cache.NewStore()
+	if err != nil {
+		return nil, noFileCompletion
+	}
+	entries, err := store.List()
+	if err != nil {
+		return nil, noFileCompletion
+	}
+
+	completions := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Reference, toComplete) {
+			completions = append(completions, entry.Reference)
+		}
+	}
+	return completions, noFileCompletion
 }
 
 func runCacheRevalidate(parent context.Context, dependencies Dependencies, reference string) error {
