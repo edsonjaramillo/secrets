@@ -32,11 +32,14 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 		return errors.New("invalid Secret Reference")
 	}
 
+	ctx, cancel := operationContext(parent, dependencies)
+	defer cancel()
+
 	store, err := cache.NewStore()
 	if err != nil {
 		return cacheFailure(err)
 	}
-	cachedValue, found, err := store.Lookup(reference)
+	cachedValue, found, err := store.LookupContext(ctx, reference)
 	if err != nil {
 		return cacheFailure(err)
 	}
@@ -44,12 +47,9 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 		_, err = stdout.Write(cachedValue)
 		return err
 	}
-	if err := store.Validate(); err != nil {
+	if err := store.ValidateContext(ctx); err != nil {
 		return cacheFailure(err)
 	}
-
-	ctx, cancel := onePasswordContext(parent, dependencies)
-	defer cancel()
 
 	value, err := retrieveSecretValue(ctx, dependencies, reference)
 	if err != nil {
@@ -58,14 +58,17 @@ func runGet(parent context.Context, stdout io.Writer, dependencies Dependencies,
 	if err := ctx.Err(); err != nil {
 		return classifyOnePasswordFailure(ctx, err, "", false)
 	}
-	if err := store.Put(reference, value, time.Now()); err != nil {
+	if err := store.PutContext(ctx, reference, value, time.Now()); err != nil {
 		return cacheFailure(err)
 	}
 	_, err = stdout.Write(value)
 	return err
 }
 
-func onePasswordContext(parent context.Context, dependencies Dependencies) (context.Context, context.CancelFunc) {
+func operationContext(parent context.Context, dependencies Dependencies) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if dependencies.StdinInteractive() {
 		return parent, func() {}
 	}
@@ -120,6 +123,12 @@ func readSecretValue(ctx context.Context, dependencies Dependencies, path, refer
 }
 
 func cacheFailure(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("cache operation timed out")
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.New("cache operation interrupted")
+	}
 	if errors.Is(err, cache.ErrEntryNotFound) {
 		return errors.New("cache entry not found")
 	}

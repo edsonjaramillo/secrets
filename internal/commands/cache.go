@@ -21,28 +21,28 @@ func newCacheCommand(dependencies Dependencies) *cobra.Command {
 			return command.Help()
 		},
 	}
-	command.AddCommand(newCacheListCommand(), newCacheClearCommand(), newCacheRevalidateCommand(dependencies))
+	command.AddCommand(newCacheListCommand(dependencies), newCacheClearCommand(dependencies), newCacheRevalidateCommand(dependencies))
 	return command
 }
 
-func newCacheListCommand() *cobra.Command {
+func newCacheListCommand(dependencies Dependencies) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List Cache Entries in a human-readable format",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			return runCacheList(command.OutOrStdout())
+			return runCacheList(command.Context(), dependencies, command.OutOrStdout())
 		},
 	}
 }
 
-func newCacheClearCommand() *cobra.Command {
+func newCacheClearCommand(dependencies Dependencies) *cobra.Command {
 	var all bool
 	command := &cobra.Command{
 		Use:               "clear [reference]",
 		Short:             "Logically remove Cache Entries",
 		Long:              "Logically remove one Cache Entry or all Cache Entries. This does not guarantee secure erasure from storage media, journals, snapshots, or backups.",
-		ValidArgsFunction: completeCachedSecretReferences,
+		ValidArgsFunction: completeCachedSecretReferences(dependencies),
 		Args: func(_ *cobra.Command, args []string) error {
 			if all {
 				if len(args) != 0 {
@@ -58,8 +58,8 @@ func newCacheClearCommand() *cobra.Command {
 			}
 			return nil
 		},
-		RunE: func(_ *cobra.Command, args []string) error {
-			return runCacheClear(args, all)
+		RunE: func(command *cobra.Command, args []string) error {
+			return runCacheClear(command.Context(), dependencies, args, all)
 		},
 	}
 	command.Flags().BoolVar(&all, "all", false, "Remove all Cache Entries")
@@ -71,7 +71,7 @@ func newCacheRevalidateCommand(dependencies Dependencies) *cobra.Command {
 	command := &cobra.Command{
 		Use:               "revalidate [reference]",
 		Short:             "Replace existing Cache Entries",
-		ValidArgsFunction: completeCachedSecretReferences,
+		ValidArgsFunction: completeCachedSecretReferences(dependencies),
 		Args: func(_ *cobra.Command, args []string) error {
 			if all {
 				if len(args) != 0 {
@@ -98,28 +98,33 @@ func newCacheRevalidateCommand(dependencies Dependencies) *cobra.Command {
 	return command
 }
 
-func completeCachedSecretReferences(command *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	const noFileCompletion = cobra.ShellCompDirectiveNoFileComp
-	if len(args) != 0 || command.Flags().Changed("all") {
-		return nil, noFileCompletion
-	}
-
-	store, err := cache.NewStore()
-	if err != nil {
-		return nil, noFileCompletion
-	}
-	entries, err := store.List()
-	if err != nil {
-		return nil, noFileCompletion
-	}
-
-	completions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Reference, toComplete) {
-			completions = append(completions, entry.Reference)
+func completeCachedSecretReferences(dependencies Dependencies) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(command *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		const noFileCompletion = cobra.ShellCompDirectiveNoFileComp
+		if len(args) != 0 || command.Flags().Changed("all") {
+			return nil, noFileCompletion
 		}
+
+		ctx, cancel := operationContext(command.Context(), dependencies)
+		defer cancel()
+
+		store, err := cache.NewStore()
+		if err != nil {
+			return nil, noFileCompletion
+		}
+		entries, err := store.ListContext(ctx)
+		if err != nil {
+			return nil, noFileCompletion
+		}
+
+		completions := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Reference, toComplete) {
+				completions = append(completions, entry.Reference)
+			}
+		}
+		return completions, noFileCompletion
 	}
-	return completions, noFileCompletion
 }
 
 func runCacheRevalidate(parent context.Context, dependencies Dependencies, reference string) error {
@@ -127,11 +132,14 @@ func runCacheRevalidate(parent context.Context, dependencies Dependencies, refer
 		return errors.New("invalid Secret Reference")
 	}
 
+	ctx, cancel := operationContext(parent, dependencies)
+	defer cancel()
+
 	store, err := cache.NewStore()
 	if err != nil {
 		return cacheFailure(err)
 	}
-	found, err := store.ValidateEntry(reference)
+	found, err := store.ValidateEntryContext(ctx, reference)
 	if err != nil {
 		return cacheFailure(err)
 	}
@@ -139,8 +147,6 @@ func runCacheRevalidate(parent context.Context, dependencies Dependencies, refer
 		return cacheFailure(cache.ErrEntryNotFound)
 	}
 
-	ctx, cancel := onePasswordContext(parent, dependencies)
-	defer cancel()
 	value, err := retrieveSecretValue(ctx, dependencies, reference)
 	if err != nil {
 		return err
@@ -148,7 +154,7 @@ func runCacheRevalidate(parent context.Context, dependencies Dependencies, refer
 	if err := ctx.Err(); err != nil {
 		return classifyOnePasswordFailure(ctx, err, "", false)
 	}
-	if err := store.Revalidate(reference, value, time.Now()); err != nil {
+	if err := store.RevalidateContext(ctx, reference, value, time.Now()); err != nil {
 		return cacheFailure(err)
 	}
 	return nil
@@ -180,20 +186,20 @@ func bulkRevalidationSummary(failures int) string {
 }
 
 func runCacheRevalidateAll(parent context.Context, dependencies Dependencies) error {
+	ctx, cancel := operationContext(parent, dependencies)
+	defer cancel()
+
 	store, err := cache.NewStore()
 	if err != nil {
 		return cacheFailure(err)
 	}
-	entries, err := store.List()
+	entries, err := store.ListContext(ctx)
 	if err != nil {
 		return cacheFailure(err)
 	}
 	if len(entries) == 0 {
 		return nil
 	}
-
-	ctx, cancel := onePasswordContext(parent, dependencies)
-	defer cancel()
 
 	path, err := authenticate(ctx, dependencies)
 	if err != nil {
@@ -231,7 +237,7 @@ func runCacheRevalidateAll(parent context.Context, dependencies Dependencies) er
 			break
 		}
 
-		if commitErr := store.Revalidate(item.Reference, value, time.Now()); commitErr != nil {
+		if commitErr := store.RevalidateContext(ctx, item.Reference, value, time.Now()); commitErr != nil {
 			failures = append(failures, bulkRevalidationFailure{
 				identifier: cache.Identifier(item.Reference),
 				reason:     cacheFailure(commitErr).Error(),
@@ -272,15 +278,18 @@ func contextFailure(ctx context.Context) error {
 	return classifyOnePasswordFailure(ctx, ctx.Err(), "", false)
 }
 
-func runCacheClear(args []string, all bool) error {
+func runCacheClear(parent context.Context, dependencies Dependencies, args []string, all bool) error {
+	ctx, cancel := operationContext(parent, dependencies)
+	defer cancel()
+
 	store, err := cache.NewStore()
 	if err != nil {
 		return cacheFailure(err)
 	}
 	if all {
-		err = store.ClearAll()
+		err = store.ClearAllContext(ctx)
 	} else {
-		err = store.Clear(args[0])
+		err = store.ClearContext(ctx, args[0])
 	}
 	if err != nil {
 		return cacheFailure(err)
@@ -288,12 +297,15 @@ func runCacheClear(args []string, all bool) error {
 	return nil
 }
 
-func runCacheList(stdout io.Writer) error {
+func runCacheList(parent context.Context, dependencies Dependencies, stdout io.Writer) error {
+	ctx, cancel := operationContext(parent, dependencies)
+	defer cancel()
+
 	store, err := cache.NewStore()
 	if err != nil {
 		return cacheFailure(err)
 	}
-	entries, err := store.List()
+	entries, err := store.ListContext(ctx)
 	if err != nil {
 		return cacheFailure(err)
 	}

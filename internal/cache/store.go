@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,8 @@ const (
 	schemaVersion   = 1
 	directoryMode   = 0o700
 	regularFileMode = 0o600
+
+	lockPollInterval = 10 * time.Millisecond
 
 	// MaximumSecretValueSize bounds values accepted from or retained in the cache.
 	MaximumSecretValueSize = 16 * 1024 * 1024
@@ -69,7 +72,12 @@ func NewStore() (Store, error) {
 
 // Lookup returns the exact bytes for reference when its Cache Entry exists.
 func (store Store) Lookup(reference string) ([]byte, bool, error) {
-	lock, exists, err := store.acquireLock(false)
+	return store.LookupContext(context.Background(), reference)
+}
+
+// LookupContext is Lookup with a cancellation-aware lock acquisition.
+func (store Store) LookupContext(ctx context.Context, reference string) ([]byte, bool, error) {
+	lock, exists, err := store.acquireLock(ctx, false)
 	if err != nil || !exists {
 		return nil, false, err
 	}
@@ -108,7 +116,12 @@ func (store Store) Lookup(reference string) ([]byte, bool, error) {
 
 // List returns every Cache Entry after validating complete cache state.
 func (store Store) List() ([]ListingEntry, error) {
-	lock, exists, err := store.acquireLock(false)
+	return store.ListContext(context.Background())
+}
+
+// ListContext is List with a cancellation-aware lock acquisition.
+func (store Store) ListContext(ctx context.Context) ([]ListingEntry, error) {
+	lock, exists, err := store.acquireLock(ctx, false)
 	if err != nil || !exists {
 		return nil, err
 	}
@@ -131,7 +144,12 @@ func (store Store) List() ([]ListingEntry, error) {
 
 // Clear removes one Cache Entry without producing output.
 func (store Store) Clear(reference string) error {
-	lock, exists, err := store.acquireLock(true)
+	return store.ClearContext(context.Background(), reference)
+}
+
+// ClearContext is Clear with a cancellation-aware lock acquisition.
+func (store Store) ClearContext(ctx context.Context, reference string) error {
+	lock, exists, err := store.acquireLock(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -170,18 +188,30 @@ func (store Store) Clear(reference string) error {
 		}
 		return err
 	}
+	if err := syncDirectory(filepath.Dir(valuePath)); err != nil {
+		return err
+	}
 	return nil
 }
 
 // ClearAll removes every Cache Entry after validating complete cache state.
 func (store Store) ClearAll() error {
-	return store.clearAll(os.Remove)
+	return store.ClearAllContext(context.Background())
+}
+
+// ClearAllContext is ClearAll with a cancellation-aware lock acquisition.
+func (store Store) ClearAllContext(ctx context.Context) error {
+	return store.clearAllContext(ctx, os.Remove)
 }
 
 // clearAll accepts the removal operation separately so partial-removal recovery
 // can be exercised without changing process-wide filesystem behavior.
 func (store Store) clearAll(remove func(string) error) error {
-	lock, exists, err := store.acquireLock(true)
+	return store.clearAllContext(context.Background(), remove)
+}
+
+func (store Store) clearAllContext(ctx context.Context, remove func(string) error) error {
+	lock, exists, err := store.acquireLock(ctx, true)
 	if err != nil || !exists {
 		return err
 	}
@@ -207,6 +237,12 @@ func (store Store) clearAll(remove func(string) error) error {
 			return err
 		}
 	}
+	if err := syncDirectory(filepath.Join(store.root, "values")); err != nil {
+		if reconcileErr := store.reconcileMetadata(state); reconcileErr != nil {
+			return reconcileErr
+		}
+		return err
+	}
 
 	if err := store.writeMetadata(metadata{Version: schemaVersion, Entries: []entry{}}); err != nil {
 		// All value files have already been removed. Keep the index truthful if
@@ -221,7 +257,12 @@ func (store Store) clearAll(remove func(string) error) error {
 
 // Validate verifies complete existing state before cache state is mutated.
 func (store Store) Validate() error {
-	lock, exists, err := store.acquireLock(false)
+	return store.ValidateContext(context.Background())
+}
+
+// ValidateContext is Validate with a cancellation-aware lock acquisition.
+func (store Store) ValidateContext(ctx context.Context) error {
+	lock, exists, err := store.acquireLock(ctx, false)
 	if err != nil || !exists {
 		return err
 	}
@@ -231,7 +272,12 @@ func (store Store) Validate() error {
 
 // ValidateEntry verifies complete cache state and reports whether reference is indexed.
 func (store Store) ValidateEntry(reference string) (bool, error) {
-	lock, exists, err := store.acquireLock(false)
+	return store.ValidateEntryContext(context.Background(), reference)
+}
+
+// ValidateEntryContext is ValidateEntry with a cancellation-aware lock acquisition.
+func (store Store) ValidateEntryContext(ctx context.Context, reference string) (bool, error) {
+	lock, exists, err := store.acquireLock(ctx, false)
 	if err != nil || !exists {
 		return false, err
 	}
@@ -311,15 +357,22 @@ func (store Store) validateValues(state metadata) error {
 
 // Put atomically replaces the individual value and metadata files for a successful retrieval.
 func (store Store) Put(reference string, value []byte, cachedAt time.Time) error {
-	if _, err := os.Lstat(store.root); errors.Is(err, os.ErrNotExist) {
-		if err := store.ensureLayout(); err != nil {
-			return err
-		}
-	} else if err != nil {
+	return store.PutContext(context.Background(), reference, value, cachedAt)
+}
+
+// PutContext is Put with a cancellation-aware lock acquisition.
+func (store Store) PutContext(ctx context.Context, reference string, value []byte, cachedAt time.Time) error {
+	if len(value) > MaximumSecretValueSize {
 		return ErrInvalidState
 	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := store.ensureLayout(); err != nil {
+		return err
+	}
 
-	lock, exists, err := store.acquireLock(true)
+	lock, exists, err := store.acquireLock(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -327,6 +380,9 @@ func (store Store) Put(reference string, value []byte, cachedAt time.Time) error
 		return ErrInvalidState
 	}
 	defer releaseLock(lock)
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 
 	state, err := store.stateForMutation()
 	if err != nil {
@@ -364,17 +420,26 @@ func (store Store) Put(reference string, value []byte, cachedAt time.Time) error
 // Revalidate replaces an existing Cache Entry after the new Secret Value has
 // been retrieved successfully. It never creates a missing Cache Entry.
 func (store Store) Revalidate(reference string, value []byte, cachedAt time.Time) error {
-	return store.revalidate(reference, value, cachedAt, os.Rename)
+	return store.RevalidateContext(context.Background(), reference, value, cachedAt)
+}
+
+// RevalidateContext is Revalidate with a cancellation-aware lock acquisition.
+func (store Store) RevalidateContext(ctx context.Context, reference string, value []byte, cachedAt time.Time) error {
+	return store.revalidateWithContext(ctx, reference, value, cachedAt, store.renameAndSync)
 }
 
 // revalidate accepts the rename operation separately so commit rollback can be
 // exercised without changing process-wide filesystem behavior.
 func (store Store) revalidate(reference string, value []byte, cachedAt time.Time, rename func(string, string) error) error {
+	return store.revalidateWithContext(context.Background(), reference, value, cachedAt, rename)
+}
+
+func (store Store) revalidateWithContext(ctx context.Context, reference string, value []byte, cachedAt time.Time, rename func(string, string) error) error {
 	if len(value) > MaximumSecretValueSize {
 		return ErrInvalidState
 	}
 
-	lock, exists, err := store.acquireLock(true)
+	lock, exists, err := store.acquireLock(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -382,6 +447,9 @@ func (store Store) revalidate(reference string, value []byte, cachedAt time.Time
 		return ErrEntryNotFound
 	}
 	defer releaseLock(lock)
+	if err := contextError(ctx); err != nil {
+		return err
+	}
 
 	state, err := store.readValidatedMetadata()
 	if err != nil {
@@ -443,6 +511,13 @@ func (store Store) writeMetadata(state metadata) error {
 	return atomicWrite(filepath.Join(store.root, "metadata.json"), content)
 }
 
+func (store Store) renameAndSync(oldPath, newPath string) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(newPath))
+}
+
 func metadataBytes(state metadata) ([]byte, error) {
 	content, err := json.Marshal(state)
 	if err != nil {
@@ -488,7 +563,11 @@ func (store Store) stateForMutation() (metadata, error) {
 	return state, nil
 }
 
-func (store Store) acquireLock(exclusive bool) (*os.File, bool, error) {
+func (store Store) acquireLock(ctx context.Context, exclusive bool) (*os.File, bool, error) {
+	ctx = contextOrBackground(ctx)
+	if err := contextError(ctx); err != nil {
+		return nil, false, err
+	}
 	if _, err := os.Lstat(store.root); errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	} else if err != nil || validateNode(store.root, true) != nil {
@@ -504,11 +583,49 @@ func (store Store) acquireLock(exclusive bool) (*os.File, bool, error) {
 		return nil, false, ErrInvalidState
 	}
 	info, err := lock.Stat()
-	if err != nil || validateInfo(info, false) != nil || lockFile(lock, exclusive) != nil {
+	if err != nil || validateInfo(info, false) != nil {
 		_ = lock.Close()
 		return nil, false, ErrInvalidState
 	}
-	return lock, true, nil
+
+	for {
+		locked, err := tryLockFile(lock, exclusive)
+		if err != nil {
+			_ = lock.Close()
+			return nil, false, ErrInvalidState
+		}
+		if locked {
+			if err := contextError(ctx); err != nil {
+				_ = unlockFile(lock)
+				_ = lock.Close()
+				return nil, false, err
+			}
+			return lock, true, nil
+		}
+
+		timer := time.NewTimer(lockPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			_ = lock.Close()
+			return nil, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 func releaseLock(lock *os.File) {
@@ -682,17 +799,37 @@ func (store Store) ensureLayout() error {
 	if err := makePrivateParents(filepath.Dir(store.root)); err != nil {
 		return err
 	}
-	if err := makePrivateDirectory(store.root); err != nil {
+
+	if info, err := os.Lstat(store.root); err == nil {
+		if validateInfo(info, true) != nil {
+			return ErrInvalidState
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ErrInvalidState
+	}
+
+	// Build a complete empty cache privately so no process can observe partial
+	// metadata while the cache lock is being initialized.
+	temporary, err := os.MkdirTemp(filepath.Dir(store.root), ".temporary-cache-*")
+	if err != nil {
 		return err
 	}
-	if err := makePrivateDirectory(filepath.Join(store.root, "values")); err != nil {
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
+	if err := os.Chmod(temporary, directoryMode); err != nil {
 		return err
 	}
-	lockPath := filepath.Join(store.root, "cache.lock")
+	if err := makePrivateDirectory(filepath.Join(temporary, "values")); err != nil {
+		return err
+	}
+
+	lockPath := filepath.Join(temporary, "cache.lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, regularFileMode)
-	if errors.Is(err, os.ErrExist) {
-		return validateNode(lockPath, false)
-	}
 	if err != nil {
 		return err
 	}
@@ -700,7 +837,29 @@ func (store Store) ensureLayout() error {
 		_ = lock.Close()
 		return err
 	}
-	return lock.Close()
+	if err := lock.Close(); err != nil {
+		return err
+	}
+
+	content, err := metadataBytes(metadata{Version: schemaVersion, Entries: []entry{}})
+	if err != nil {
+		return err
+	}
+	if err := atomicWrite(filepath.Join(temporary, "metadata.json"), content); err != nil {
+		return err
+	}
+	if err := syncDirectory(temporary); err != nil {
+		return err
+	}
+
+	if err := os.Rename(temporary, store.root); err != nil {
+		if _, statErr := os.Lstat(store.root); statErr != nil {
+			return err
+		}
+		return nil
+	}
+	removeTemporary = false
+	return syncDirectory(filepath.Dir(store.root))
 }
 
 func makePrivateParents(path string) error {
@@ -734,7 +893,23 @@ func atomicWrite(path string, content []byte) error {
 		return err
 	}
 	defer func() { _ = os.Remove(temporaryPath) }()
-	return os.Rename(temporaryPath, path)
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func prepareAtomicWrite(path string, content []byte) (string, error) {

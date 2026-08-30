@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1392,6 +1393,121 @@ func createEmptyCache(t *testing.T, environment testEnvironment) {
 	}
 }
 
+func TestCacheLockContention(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("cache locking is supported on macOS and Linux")
+	}
+
+	binary := buildCLI(t, "")
+	environment := isolatedEnvironment(t)
+	environment.variables = append(environment.variables, "FAKE_OP_MODE=get-exact")
+	reference := "op://vault/item/field"
+	assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+
+	holder := startCacheLockHolder(t, filepath.Join(cacheRoot(environment), "cache.lock"))
+	defer stopCacheLockHolder(t, holder)
+
+	started := time.Now()
+	got := runCommandWithTimeout(exec.Command(binary, "cache", "list"), environment, 7*time.Second)
+	elapsed := time.Since(started)
+
+	assertResult(t, got, "", "Error: cache operation timed out\n", true)
+	if elapsed < 4*time.Second || elapsed >= 7*time.Second {
+		t.Errorf("cache lock did not share the five second deadline, elapsed %s", elapsed)
+	}
+
+	started = time.Now()
+	got = runCLIWithTerminalSignal(t, binary, environment, "cache", "list")
+	if got.stdout != "" || got.stderr != "Error: cache operation interrupted\n" || got.err == nil {
+		t.Errorf("interactive cache lock cancellation result: %+v", got)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Errorf("interactive cache lock cancellation took %s", elapsed)
+	}
+}
+
+func TestConcurrentCacheMutations(t *testing.T) {
+	binary := buildCLI(t, "")
+	reference := "op://vault/item/field"
+
+	t.Run("an unrelated cache miss survives an in-flight Revalidation", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		resetInvocation(t, environment)
+
+		release := filepath.Join(t.TempDir(), "release")
+		revalidationEnvironment := environment
+		revalidationEnvironment.variables = append([]string(nil), environment.variables...)
+		setEnvironmentVariable(&revalidationEnvironment, "FAKE_OP_MODE", "revalidate-block")
+		setEnvironmentVariable(&revalidationEnvironment, "FAKE_OP_RELEASE", release)
+		command, done := startCommand(t, exec.Command(binary, "cache", "revalidate", reference), revalidationEnvironment)
+		defer finishCommand(t, command, done, release)
+		waitForInvocation(t, environment, "read --no-newline "+reference)
+
+		unrelated := "op://vault/unrelated/field"
+		unrelatedEnvironment := environment
+		unrelatedEnvironment.variables = append([]string(nil), environment.variables...)
+		setEnvironmentVariable(&unrelatedEnvironment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, unrelatedEnvironment, "get", unrelated), []byte("opaque value\nwith trailing newline\n"))
+
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Fatalf("release Revalidation: %v", err)
+		}
+		result := <-done
+		assertResult(t, result, "", "", false)
+
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		if len(metadata.Entries) != 2 {
+			t.Fatalf("concurrent unrelated mutation lost an entry: %+v", metadata.Entries)
+		}
+		for _, item := range []string{reference, unrelated} {
+			if _, err := os.Stat(filepath.Join(cacheRoot(environment), "values", referenceIdentifier(item))); err != nil {
+				t.Errorf("value for %q missing after concurrent mutation: %v", item, err)
+			}
+		}
+	})
+
+	t.Run("clear wins over an in-flight Revalidation", func(t *testing.T) {
+		environment := isolatedEnvironment(t)
+		setEnvironmentVariable(&environment, "FAKE_OP_MODE", "get-exact")
+		assertSecretResult(t, runCLI(t, binary, environment, "get", reference), []byte("opaque value\nwith trailing newline\n"))
+		resetInvocation(t, environment)
+
+		release := filepath.Join(t.TempDir(), "release")
+		revalidationEnvironment := environment
+		revalidationEnvironment.variables = append([]string(nil), environment.variables...)
+		setEnvironmentVariable(&revalidationEnvironment, "FAKE_OP_MODE", "revalidate-block")
+		setEnvironmentVariable(&revalidationEnvironment, "FAKE_OP_RELEASE", release)
+		command, done := startCommand(t, exec.Command(binary, "cache", "revalidate", reference), revalidationEnvironment)
+		defer finishCommand(t, command, done, release)
+		waitForInvocation(t, environment, "read --no-newline "+reference)
+
+		clearEnvironment := environment
+		clearEnvironment.variables = append([]string(nil), environment.variables...)
+		setEnvironmentVariable(&clearEnvironment, "FAKE_OP_MODE", "get-exact")
+		assertResult(t, runCLI(t, binary, clearEnvironment, "cache", "clear", reference), "", "", false)
+
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Fatalf("release cleared Revalidation: %v", err)
+		}
+		result := <-done
+		assertResult(t, result, "", "Error: cache entry not found\n", true)
+
+		metadata := readCacheMetadata(t, cacheRoot(environment))
+		if len(metadata.Entries) != 0 {
+			t.Fatalf("clear was undone by in-flight Revalidation: %+v", metadata.Entries)
+		}
+		values, err := os.ReadDir(filepath.Join(cacheRoot(environment), "values"))
+		if err != nil {
+			t.Fatalf("read values after clear race: %v", err)
+		}
+		if len(values) != 0 {
+			t.Errorf("clear race left value files: %v", values)
+		}
+	})
+}
+
 func TestCompletion(t *testing.T) {
 	binary := buildCLI(t, "")
 
@@ -1777,6 +1893,11 @@ case "$1:$FAKE_OP_MODE" in
     printf 'opaque value\nwith trailing newline\n'
     exit 0
     ;;
+  read:revalidate-block)
+    while [ ! -f "$FAKE_OP_RELEASE" ]; do sleep 0.01; done
+    printf 'revalidated value\n'
+    exit 0
+    ;;
   read:get-exact-slow)
     sleep 0.1
     printf 'opaque value\nwith trailing newline\n'
@@ -1928,10 +2049,110 @@ func runCommand(command *exec.Cmd, environment testEnvironment) result {
 	return result{stdout: stdout.String(), stderr: stderr.String(), err: err}
 }
 
+func runCommandWithTimeout(command *exec.Cmd, environment testEnvironment, timeout time.Duration) result {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	command = exec.CommandContext(ctx, command.Path, command.Args[1:]...)
+	return runCommand(command, environment)
+}
+
+func startCommand(t *testing.T, command *exec.Cmd, environment testEnvironment) (*exec.Cmd, <-chan result) {
+	t.Helper()
+
+	command.Env = environment.variables
+	command.Stdin = bytes.NewReader(nil)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start command: %v", err)
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		err := command.Wait()
+		done <- result{stdout: stdout.String(), stderr: stderr.String(), err: err}
+		close(done)
+	}()
+	return command, done
+}
+
+func finishCommand(t *testing.T, command *exec.Cmd, done <-chan result, release string) {
+	t.Helper()
+
+	if _, err := os.Stat(release); os.IsNotExist(err) {
+		_ = os.WriteFile(release, nil, 0o600)
+	}
+	select {
+	case <-done:
+		return
+	case <-time.After(2 * time.Second):
+		_ = command.Process.Kill()
+		<-done
+		t.Fatal("concurrent command did not finish")
+	}
+}
+
+func waitForInvocation(t *testing.T, environment testEnvironment, fragment string) {
+	t.Helper()
+
+	path := filepath.Join(environment.fakeBin, "op-invoked")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		content, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(content), fragment) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake op did not record invocation %q", fragment)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func runCLIWithTerminal(t *testing.T, binary string, environment testEnvironment, input string, cancel bool) result {
 	t.Helper()
 
 	return runCLIWithTerminalArgs(t, binary, environment, input, cancel, "status")
+}
+
+func runCLIWithTerminalSignal(t *testing.T, binary string, environment testEnvironment, args ...string) result {
+	t.Helper()
+
+	terminal, childTerminal, err := pty.Open()
+	if err != nil {
+		t.Fatalf("open terminal: %v", err)
+	}
+	defer func() { _ = terminal.Close() }()
+	defer func() { _ = childTerminal.Close() }()
+
+	command := exec.Command(binary, args...)
+	command.Env = environment.variables
+	command.Stdin = childTerminal
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start CLI: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("interrupt CLI: %v", err)
+	}
+
+	finished := make(chan error, 1)
+	go func() { finished <- command.Wait() }()
+	select {
+	case err = <-finished:
+	case <-time.After(2 * time.Second):
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal("CLI did not stop after interactive cancellation")
+	}
+	return result{stdout: stdout.String(), stderr: stderr.String(), err: err}
 }
 
 func runCLIWithTerminalArgs(t *testing.T, binary string, environment testEnvironment, input string, cancel bool, args ...string) result {

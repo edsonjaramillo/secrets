@@ -12,8 +12,8 @@ func ownedByCurrentUser(_ os.FileInfo) bool {
 	return false
 }
 
-func lockFile(_ *os.File, _ bool) error {
-	return ErrUnsupportedPlatform
+func tryLockFile(_ *os.File, _ bool) (bool, error) {
+	return false, ErrUnsupportedPlatform
 }
 
 func unlockFile(_ *os.File) error {
